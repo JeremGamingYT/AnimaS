@@ -691,7 +691,7 @@ def train_vqvae(
         # Save sample at epoch end
         if last_batch_x is None:
             continue
-    model.eval()
+        model.eval()
         with torch.no_grad():
             out_vis = model(last_batch_x[:4])
         save_image_grid(last_batch_x[:4], out_vis["recon"], Path("samples/vqvae"), f"epoch_{epoch:03d}.png")
@@ -773,7 +773,7 @@ def train_gpt_next(data_root: str, vqvae_ckpt: str, out_path: str, image_size: i
         if last_batch is not None:
             gpt.eval()
             x_vis_t = last_batch[0][:1]
-        with torch.no_grad():
+            with torch.no_grad():
                 ids_t, _ = vqvae.encode_to_indices(x_vis_t)
                 prev_tokens = ids_t.view(1, -1)
                 bos = torch.full((1, 1), bos_id, dtype=torch.long, device=device_t)

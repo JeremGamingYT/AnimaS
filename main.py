@@ -413,7 +413,7 @@ def train_vqvae(data_root: str, out_path: str, image_size: int = 128, batch_size
 
     cfg = VQVAEConfig(image_size=image_size, in_channels=3, hidden_channels=hidden_channels, latent_channels=latent_channels, num_embeddings=num_embeddings, embedding_dim=embedding_dim, downsample_factor=downsample_factor, commitment_cost=0.25, use_ema=True, ema_decay=0.99)
     model = VQVAE(cfg).to(device_t)
-    scaler = torch.amp.GradScaler("cuda") if device_t.type == "cuda" else torch.amp.GradScaler("cpu")
+    scaler = torch.amp.GradScaler(device_t.type)
     opt = torch.optim.Adam(model.parameters(), lr=lr)
     recon_crit = nn.L1Loss()
 
@@ -439,12 +439,13 @@ def train_vqvae(data_root: str, out_path: str, image_size: int = 128, batch_size
             pbar.set_postfix({"recon": float(recon_loss), "vq": float(vq_loss)})
 
         # Save sample at epoch end
-        if last_batch_x is not None:
-    model.eval()
-            with torch.no_grad():
-                out_vis = model(last_batch_x[:4])
-            save_image_grid(last_batch_x[:4], out_vis["recon"], Path("samples/vqvae"), f"epoch_{epoch:03d}.png")
-            model.train()
+        if last_batch_x is None:
+            continue
+        model.eval()
+        with torch.no_grad():
+            out_vis = model(last_batch_x[:4])
+        save_image_grid(last_batch_x[:4], out_vis["recon"], Path("samples/vqvae"), f"epoch_{epoch:03d}.png")
+        model.train()
 
     out_path_p = Path(out_path)
     out_path_p.parent.mkdir(parents=True, exist_ok=True)
@@ -478,7 +479,7 @@ def train_gpt_next(data_root: str, vqvae_ckpt: str, out_path: str, image_size: i
     gptcfg = GPTConfig(vocab_size=vocab_size, max_seq_len=max_seq_len, embed_dim=embed_dim, num_layers=layers, num_heads=heads, dropout=0.1)
     gpt = GPTNextFrame(gptcfg).to(device_t)
 
-    scaler = torch.amp.GradScaler("cuda") if device_t.type == "cuda" else torch.amp.GradScaler("cpu")
+    scaler = torch.amp.GradScaler(device_t.type)
     opt = torch.optim.AdamW(gpt.parameters(), lr=lr, betas=(0.9, 0.95), weight_decay=0.01)
     ce_loss = nn.CrossEntropyLoss(ignore_index=-100)
 

@@ -440,6 +440,136 @@ def save_image_grid(x_in: torch.Tensor, x_rec: torch.Tensor, out_dir: Path, name
     T.ToPILImage()(grid.cpu()).save(out_dir / name)
 
 
+# ------------------------------ Phase 1: AE ---------------------------------
+
+
+@dataclass
+class AEConfig:
+    image_size: int = 128
+    in_channels: int = 3
+    base_channels: int = 64
+    bottleneck_channels: int = 512
+
+
+class ConvAutoencoder(nn.Module):
+    def __init__(self, cfg: AEConfig) -> None:
+        super().__init__()
+        c = cfg.base_channels
+        self.encoder = nn.Sequential(
+            nn.Conv2d(cfg.in_channels, c, 4, 2, 1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(c, c * 2, 4, 2, 1),
+            nn.BatchNorm2d(c * 2),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(c * 2, c * 4, 4, 2, 1),
+            nn.BatchNorm2d(c * 4),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(c * 4, cfg.bottleneck_channels, 3, 1, 1),
+            nn.ReLU(inplace=True),
+        )
+        self.decoder = nn.Sequential(
+            nn.Conv2d(cfg.bottleneck_channels, c * 4, 3, 1, 1),
+            nn.ReLU(inplace=True),
+            nn.ConvTranspose2d(c * 4, c * 2, 4, 2, 1),
+            nn.BatchNorm2d(c * 2),
+            nn.ReLU(inplace=True),
+            nn.ConvTranspose2d(c * 2, c, 4, 2, 1),
+            nn.BatchNorm2d(c),
+            nn.ReLU(inplace=True),
+            nn.ConvTranspose2d(c, cfg.in_channels, 4, 2, 1),
+            nn.Tanh(),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        z = self.encoder(x)
+        return self.decoder(z)
+
+
+def ssim_loss_simple(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    C1 = 0.01 ** 2
+    C2 = 0.03 ** 2
+    mu_x = x.mean(dim=[2, 3], keepdim=True)
+    mu_y = y.mean(dim=[2, 3], keepdim=True)
+    sigma_x = x.var(dim=[2, 3], keepdim=True)
+    sigma_y = y.var(dim=[2, 3], keepdim=True)
+    sigma_xy = ((x - mu_x) * (y - mu_y)).mean(dim=[2, 3], keepdim=True)
+    ssim = ((2 * mu_x * mu_y + C1) * (2 * sigma_xy + C2)) / ((mu_x ** 2 + mu_y ** 2 + C1) * (sigma_x + sigma_y + C2))
+    return (1 - ssim).mean()
+
+
+def train_autoencoder_phase1(
+    data_root: str,
+    out_path: str,
+    image_size: int = 128,
+    batch_size: int = 16,
+    epochs: int = 20,
+    lr: float = 1e-4,
+    ssim_weight: float = 0.5,
+    device: str = "cuda",
+) -> str:
+    device_t = torch.device(device if torch.cuda.is_available() or device == "cpu" else "cpu")
+    ds = FramePairDataset(root=data_root, image_size=image_size, is_train=True)
+    dl = DataLoader(ds, batch_size=batch_size, shuffle=True, num_workers=4, pin_memory=True)
+
+    cfg = AEConfig(image_size=image_size, in_channels=3, base_channels=64, bottleneck_channels=512)
+    model = ConvAutoencoder(cfg).to(device_t)
+    opt = torch.optim.Adam(model.parameters(), lr=lr)
+    l1 = nn.L1Loss()
+
+    model.train()
+    last_batch_x = None
+    for epoch in range(1, epochs + 1):
+        pbar = tqdm(dl, desc=f"AE {epoch}/{epochs}")
+        for x_t, _ in pbar:
+            x = x_t.to(device_t, non_blocking=True)
+            last_batch_x = x
+            recon = model(x)
+            loss_l1 = l1(recon, x)
+            loss_ssim = ssim_loss_simple(recon, x)
+            loss = loss_l1 + ssim_weight * loss_ssim
+            opt.zero_grad(set_to_none=True)
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            opt.step()
+            pbar.set_postfix({"l1": float(loss_l1), "ssim": float(loss_ssim)})
+
+        if last_batch_x is None:
+            continue
+        model.eval()
+        with torch.no_grad():
+            out_vis = model(last_batch_x[:4])
+        save_image_grid(last_batch_x[:4], out_vis, Path("samples/ae"), f"epoch_{epoch:03d}.png")
+        model.train()
+
+    out_path_p = Path(out_path)
+    out_path_p.parent.mkdir(parents=True, exist_ok=True)
+    torch.save({"state_dict": model.state_dict(), "config": cfg.__dict__}, out_path_p)
+    return str(out_path_p)
+
+
+@torch.no_grad()
+def reconstruct_image_phase1(image_path: str, ckpt_path: str, out_path: str, device: str = "cuda") -> str:
+    device_t = torch.device(device if torch.cuda.is_available() or device == "cpu" else "cpu")
+    ckpt = torch.load(ckpt_path, map_location="cpu")
+    cfg = AEConfig(**ckpt["config"])  # type: ignore[arg-type]
+    model = ConvAutoencoder(cfg).to(device_t)
+    model.load_state_dict(ckpt["state_dict"])  # type: ignore[index]
+    model.eval()
+
+    tfm = T.Compose([
+        T.Resize(cfg.image_size, interpolation=T.InterpolationMode.BICUBIC, antialias=True),
+        T.CenterCrop(cfg.image_size),
+        T.ToTensor(),
+        T.Normalize([0.5, 0.5, 0.5], [0.5, 0.5, 0.5]),
+    ])
+    img = Image.open(image_path).convert("RGB")
+    x = tfm(img).unsqueeze(0).to(device_t)
+    recon = model(x)
+    out_dir = Path(out_path)
+    out_dir.parent.mkdir(parents=True, exist_ok=True)
+    save_image_grid(x, recon, out_dir.parent, Path(out_path).name)
+    return out_path
+
 def train_vqvae(
     data_root: str,
     out_path: str,
@@ -669,6 +799,22 @@ def parse_cli() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="All-in-one: train VQ-VAE, train GPT next-frame, and predict.")
     sub = p.add_subparsers(dest="cmd", required=True)
 
+    p_ae = sub.add_parser("train_ae")
+    p_ae.add_argument("--data-root", type=str, required=True)
+    p_ae.add_argument("--out", type=str, default="checkpoints/ae.pt")
+    p_ae.add_argument("--image-size", type=int, default=128)
+    p_ae.add_argument("--batch-size", type=int, default=16)
+    p_ae.add_argument("--epochs", type=int, default=20)
+    p_ae.add_argument("--lr", type=float, default=1e-4)
+    p_ae.add_argument("--ssim-weight", type=float, default=0.5)
+    p_ae.add_argument("--device", type=str, default="cuda")
+
+    p_aep = sub.add_parser("reconstruct")
+    p_aep.add_argument("--image", type=str, required=True)
+    p_aep.add_argument("--ckpt", type=str, required=True)
+    p_aep.add_argument("--out", type=str, default="outputs_ae/recon.png")
+    p_aep.add_argument("--device", type=str, default="cuda")
+
     p_vq = sub.add_parser("train_vqvae")
     p_vq.add_argument("--data-root", type=str, required=True)
     p_vq.add_argument("--out", type=str, default="checkpoints/vqvae.pt")
@@ -718,7 +864,22 @@ def parse_cli() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_cli()
-    if args.cmd == "train_vqvae":
+    if args.cmd == "train_ae":
+        ckpt = train_autoencoder_phase1(
+            data_root=args.data_root,
+            out_path=args.out,
+            image_size=args.image_size,
+            batch_size=args.batch_size,
+            epochs=args.epochs,
+            lr=args.lr,
+            ssim_weight=args.ssim_weight,
+            device=args.device,
+        )
+        print(f"Saved AE: {ckpt}")
+    elif args.cmd == "reconstruct":
+        out = reconstruct_image_phase1(image_path=args.image, ckpt_path=args.ckpt, out_path=args.out, device=args.device)
+        print(f"Saved reconstruction to {out}")
+    elif args.cmd == "train_vqvae":
         ckpt = train_vqvae(
             data_root=args.data_root,
             out_path=args.out,

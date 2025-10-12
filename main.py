@@ -180,7 +180,7 @@ class Decoder(nn.Module):
 
 
 class VectorQuantizer(nn.Module):
-    def __init__(self, num_embeddings: int, embedding_dim: int, commitment_cost: float = 0.25, use_ema: bool = True, ema_decay: float = 0.99, eps: float = 1e-5, ema_warmup_steps: int = 100, max_codebook_norm: float = 2.0) -> None:
+    def __init__(self, num_embeddings: int, embedding_dim: int, commitment_cost: float = 0.25, use_ema: bool = True, ema_decay: float = 0.99, eps: float = 1e-5, ema_warmup_steps: int = 100, max_codebook_norm: float = 2.0, dead_code_threshold: float = 1.0, dead_code_check_steps: int = 100) -> None:
         super().__init__()
         self.num_embeddings = int(num_embeddings)
         self.embedding_dim = int(embedding_dim)
@@ -190,6 +190,8 @@ class VectorQuantizer(nn.Module):
         self.eps = float(eps)
         self.ema_warmup_steps = int(ema_warmup_steps)
         self.max_codebook_norm = float(max_codebook_norm)
+        self.dead_code_threshold = float(dead_code_threshold)
+        self.dead_code_check_steps = int(dead_code_check_steps)
         self.embedding = nn.Embedding(self.num_embeddings, self.embedding_dim)
         nn.init.uniform_(self.embedding.weight, -1.0 / self.num_embeddings, 1.0 / self.num_embeddings)
         if self.use_ema:
@@ -233,6 +235,15 @@ class VectorQuantizer(nn.Module):
             # Clamp codebook values to prevent extreme scales
             updated = torch.clamp(updated, min=-self.max_codebook_norm, max=self.max_codebook_norm)
             self.embedding.weight.data.copy_(updated)
+            # Dead-code revival
+            if self._steps.item() % self.dead_code_check_steps == 0:
+                dead_mask = self.ema_cluster_size < self.dead_code_threshold
+                if bool(dead_mask.any()):
+                    num_dead = int(dead_mask.sum().item())
+                    rand_src = z_e_flat[torch.randint(0, z_e_flat.shape[0], (num_dead,), device=z_e_flat.device)]
+                    self.embedding.weight.data[dead_mask] = rand_src
+                    self.ema_w.data[dead_mask] = rand_src
+                    self.ema_cluster_size.data[dead_mask] = self.ema_cluster_size.mean().clamp_min(1.0)
             codebook = torch.tensor(0.0, device=z_e.device, dtype=z_e_32.dtype)
         else:
             # Non-EMA variant: update codebook with gradients
@@ -267,6 +278,8 @@ class VQVAEConfig:
     ema_decay: float = 0.99
     ema_warmup_steps: int = 100
     max_codebook_norm: float = 2.0
+    dead_code_threshold: float = 1.0
+    dead_code_check_steps: int = 100
 
 
 class VQVAE(nn.Module):
@@ -287,6 +300,8 @@ class VQVAE(nn.Module):
             ema_decay=config.ema_decay,
             ema_warmup_steps=config.ema_warmup_steps,
             max_codebook_norm=config.max_codebook_norm,
+            dead_code_threshold=config.dead_code_threshold,
+            dead_code_check_steps=config.dead_code_check_steps,
         )
         self.proj_to_code = nn.Conv2d(config.latent_channels, config.embedding_dim, kernel_size=1)
         self.proj_from_code = nn.Conv2d(config.embedding_dim, config.latent_channels, kernel_size=1)
@@ -441,6 +456,9 @@ def train_vqvae(
     ema_decay: float = 0.99,
     ema_warmup_steps: int = 100,
     max_codebook_norm: float = 2.0,
+    dead_code_threshold: float = 1.0,
+    dead_code_check_steps: int = 100,
+    recon_weight: float = 1.0,
     device: str = "cuda",
 ) -> str:
     device_t = torch.device(device if torch.cuda.is_available() or device == "cpu" else "cpu")
@@ -460,9 +478,10 @@ def train_vqvae(
         ema_decay=ema_decay,
         ema_warmup_steps=ema_warmup_steps,
         max_codebook_norm=max_codebook_norm,
+        dead_code_threshold=dead_code_threshold,
+        dead_code_check_steps=dead_code_check_steps,
     )
     model = VQVAE(cfg).to(device_t)
-    scaler = torch.amp.GradScaler(device_t.type)
     opt = torch.optim.Adam(model.parameters(), lr=lr)
     recon_crit = nn.L1Loss()
 
@@ -479,13 +498,11 @@ def train_vqvae(
                 recon = out["recon"]
                 vq_loss = out["vq_loss"]
                 recon_loss = recon_crit(recon, x)
-                loss = recon_loss + vq_loss
+                loss = recon_weight * recon_loss + vq_loss
             opt.zero_grad(set_to_none=True)
-            scaler.scale(loss).backward()
-            scaler.unscale_(opt)
+            loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            scaler.step(opt)
-            scaler.update()
+            opt.step()
             pbar.set_postfix({"recon": float(recon_loss), "vq": float(vq_loss), "perp": float(out["perplexity"])})
 
         # Save sample at epoch end
@@ -668,6 +685,9 @@ def parse_cli() -> argparse.Namespace:
     p_vq.add_argument("--ema-decay", type=float, default=0.99)
     p_vq.add_argument("--ema-warmup-steps", type=int, default=100)
     p_vq.add_argument("--max-codebook-norm", type=float, default=2.0)
+    p_vq.add_argument("--dead-code-threshold", type=float, default=1.0)
+    p_vq.add_argument("--dead-code-check-steps", type=int, default=100)
+    p_vq.add_argument("--recon-weight", type=float, default=1.0)
     p_vq.add_argument("--device", type=str, default="cuda")
 
     p_gpt = sub.add_parser("train_gpt")
@@ -715,6 +735,9 @@ def main() -> None:
             ema_decay=args.ema_decay,
             ema_warmup_steps=args.ema_warmup_steps,
             max_codebook_norm=args.max_codebook_norm,
+            dead_code_threshold=args.dead_code_threshold,
+            dead_code_check_steps=args.dead_code_check_steps,
+            recon_weight=args.recon_weight,
             device=args.device,
         )
         print(f"Saved VQ-VAE: {ckpt}")

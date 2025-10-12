@@ -425,12 +425,42 @@ def save_image_grid(x_in: torch.Tensor, x_rec: torch.Tensor, out_dir: Path, name
     T.ToPILImage()(grid.cpu()).save(out_dir / name)
 
 
-def train_vqvae(data_root: str, out_path: str, image_size: int = 128, batch_size: int = 8, epochs: int = 8, lr: float = 3e-4, downsample_factor: int = 16, num_embeddings: int = 512, embedding_dim: int = 128, hidden_channels: int = 96, latent_channels: int = 192, device: str = "cuda") -> str:
+def train_vqvae(
+    data_root: str,
+    out_path: str,
+    image_size: int = 128,
+    batch_size: int = 8,
+    epochs: int = 8,
+    lr: float = 3e-4,
+    downsample_factor: int = 16,
+    num_embeddings: int = 512,
+    embedding_dim: int = 128,
+    hidden_channels: int = 96,
+    latent_channels: int = 192,
+    commitment_cost: float = 0.25,
+    ema_decay: float = 0.99,
+    ema_warmup_steps: int = 100,
+    max_codebook_norm: float = 2.0,
+    device: str = "cuda",
+) -> str:
     device_t = torch.device(device if torch.cuda.is_available() or device == "cpu" else "cpu")
     ds = FramePairDataset(root=data_root, image_size=image_size, is_train=True)
     dl = DataLoader(ds, batch_size=batch_size, shuffle=True, num_workers=4, pin_memory=True)
 
-    cfg = VQVAEConfig(image_size=image_size, in_channels=3, hidden_channels=hidden_channels, latent_channels=latent_channels, num_embeddings=num_embeddings, embedding_dim=embedding_dim, downsample_factor=downsample_factor, commitment_cost=0.25, use_ema=True, ema_decay=0.99)
+    cfg = VQVAEConfig(
+        image_size=image_size,
+        in_channels=3,
+        hidden_channels=hidden_channels,
+        latent_channels=latent_channels,
+        num_embeddings=num_embeddings,
+        embedding_dim=embedding_dim,
+        downsample_factor=downsample_factor,
+        commitment_cost=commitment_cost,
+        use_ema=True,
+        ema_decay=ema_decay,
+        ema_warmup_steps=ema_warmup_steps,
+        max_codebook_norm=max_codebook_norm,
+    )
     model = VQVAE(cfg).to(device_t)
     scaler = torch.amp.GradScaler(device_t.type)
     opt = torch.optim.Adam(model.parameters(), lr=lr)
@@ -629,6 +659,15 @@ def parse_cli() -> argparse.Namespace:
     p_vq.add_argument("--batch-size", type=int, default=8)
     p_vq.add_argument("--epochs", type=int, default=8)
     p_vq.add_argument("--lr", type=float, default=3e-4)
+    p_vq.add_argument("--downsample-factor", type=int, default=16, choices=[4, 8, 16])
+    p_vq.add_argument("--num-embeddings", type=int, default=512)
+    p_vq.add_argument("--embedding-dim", type=int, default=128)
+    p_vq.add_argument("--hidden-channels", type=int, default=96)
+    p_vq.add_argument("--latent-channels", type=int, default=192)
+    p_vq.add_argument("--commitment-cost", type=float, default=0.25)
+    p_vq.add_argument("--ema-decay", type=float, default=0.99)
+    p_vq.add_argument("--ema-warmup-steps", type=int, default=100)
+    p_vq.add_argument("--max-codebook-norm", type=float, default=2.0)
     p_vq.add_argument("--device", type=str, default="cuda")
 
     p_gpt = sub.add_parser("train_gpt")
@@ -660,7 +699,24 @@ def parse_cli() -> argparse.Namespace:
 def main() -> None:
     args = parse_cli()
     if args.cmd == "train_vqvae":
-        ckpt = train_vqvae(data_root=args.data_root, out_path=args.out, image_size=args.image_size, batch_size=args.batch_size, epochs=args.epochs, lr=args.lr, device=args.device)
+        ckpt = train_vqvae(
+            data_root=args.data_root,
+            out_path=args.out,
+            image_size=args.image_size,
+            batch_size=args.batch_size,
+            epochs=args.epochs,
+            lr=args.lr,
+            downsample_factor=args.downsample_factor,
+            num_embeddings=args.num_embeddings,
+            embedding_dim=args.embedding_dim,
+            hidden_channels=args.hidden_channels,
+            latent_channels=args.latent_channels,
+            commitment_cost=args.commitment_cost,
+            ema_decay=args.ema_decay,
+            ema_warmup_steps=args.ema_warmup_steps,
+            max_codebook_norm=args.max_codebook_norm,
+            device=args.device,
+        )
         print(f"Saved VQ-VAE: {ckpt}")
     elif args.cmd == "train_gpt":
         ckpt, meta = train_gpt_next(data_root=args.data_root, vqvae_ckpt=args.vqvae, out_path=args.out, image_size=args.image_size, batch_size=args.batch_size, epochs=args.epochs, lr=args.lr, embed_dim=args.embed_dim, layers=args.layers, heads=args.heads, device=args.device)

@@ -23,7 +23,7 @@ from typing import Callable, List, Optional, Sequence, Tuple
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset, DataLoader, Subset
 from PIL import Image
 import torchvision.transforms as T
 import torchvision.transforms.functional as TF
@@ -477,6 +477,23 @@ def save_image_grid(x_in: torch.Tensor, x_rec: torch.Tensor, out_dir: Path, name
     x_rec = torch.nan_to_num(torch.clamp((x_rec + 1.0) * 0.5, 0.0, 1.0))
     grid = torch.cat([x_in, x_rec], dim=3)[0]
     T.ToPILImage()(grid.cpu()).save(out_dir / name)
+
+
+def _to01(x: torch.Tensor) -> torch.Tensor:
+    return torch.nan_to_num(torch.clamp((x + 1.0) * 0.5, 0.0, 1.0))
+
+
+def ssim_value(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    # convert to [-1,1] expected by our ssim_loss_simple
+    return 1.0 - ssim_loss_simple(x, y)
+
+
+def psnr_value(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    # compute on [0,1]
+    x01 = _to01(x)
+    y01 = _to01(y)
+    mse = F.mse_loss(x01, y01)
+    return 10.0 * torch.log10(torch.tensor(1.0, device=x.device) / (mse + 1e-8))
 
 
 # ------------------------------ Phase 1: AE ---------------------------------
@@ -1034,6 +1051,74 @@ def predict_autoregressive(image_path: str, vqvae_ckpt: str, gpt_ckpt: str, step
         im.save(out_dir_p / f"next_{i:03d}.png")
 
 
+def evaluate_next_frame(
+    data_root: str,
+    vqvae_ckpt: str,
+    gpt_ckpt: str,
+    num_batches: int = 10,
+    image_size: int = 128,
+    batch_size: int = 4,
+    temperature: float = 0.9,
+    top_k: int = 50,
+    device: str = "cuda",
+) -> dict:
+    """Compute average PSNR/SSIM between predicted next frames and ground truth frames."""
+    device_t = torch.device(device if torch.cuda.is_available() or device == "cpu" else "cpu")
+    vq_ckpt = torch.load(vqvae_ckpt, map_location="cpu")
+    vqcfg = VQVAEConfig(**vq_ckpt["config"])  # type: ignore[arg-type]
+    vqvae = VQVAE(vqcfg).to(device_t)
+    vqvae.load_state_dict(vq_ckpt["state_dict"])  # type: ignore[index]
+    vqvae.eval()
+
+    gpt_ckpt_d = torch.load(gpt_ckpt, map_location="cpu")
+    gptcfg = GPTConfig(**gpt_ckpt_d["config"])  # type: ignore[arg-type]
+    gpt = GPTNextFrame(gptcfg).to(device_t)
+    gpt.load_state_dict(gpt_ckpt_d["state_dict"])  # type: ignore[index]
+    gpt.eval()
+
+    meta = gpt_ckpt_d["meta"]  # type: ignore[index]
+    tokens_per_frame = int(meta["tokens_per_frame"])  # type: ignore[index]
+    h_code = int(meta["h_code"])  # type: ignore[index]
+    w_code = int(meta["w_code"])  # type: ignore[index]
+    bos_id = int(meta["bos_id"])  # type: ignore[index]
+    sep_id = int(meta["sep_id"])  # type: ignore[index]
+    image_size = int(meta["image_size"])  # type: ignore[index]
+
+    ds = FramePairDataset(root=data_root, image_size=image_size, is_train=False)
+    dl = DataLoader(ds, batch_size=batch_size, shuffle=True, num_workers=2, pin_memory=True)
+
+    psnr_list: List[float] = []
+    ssim_list: List[float] = []
+    processed = 0
+
+    for x_t, x_tp1 in dl:
+        x_t = x_t.to(device_t)
+        x_tp1 = x_tp1.to(device_t)
+        with torch.no_grad():
+            ids_t, _ = vqvae.encode_to_indices(x_t)
+            prev_tokens = ids_t.view(x_t.shape[0], -1)
+            bos = torch.full((x_t.shape[0], 1), bos_id, dtype=torch.long, device=device_t)
+            sep = torch.full((x_t.shape[0], 1), sep_id, dtype=torch.long, device=device_t)
+            prefix_ids = torch.cat([bos, prev_tokens, sep], dim=1)
+            seg_prev = torch.zeros((x_t.shape[0], 1 + prev_tokens.shape[1]), dtype=torch.long, device=device_t)
+            seg_sep = torch.ones((x_t.shape[0], 1), dtype=torch.long, device=device_t)
+            prefix_segs = torch.cat([seg_prev, seg_sep], dim=1)
+            generated = gpt.generate(prefix_ids, prefix_segs, max_new_tokens=tokens_per_frame, temperature=temperature, top_k=top_k, forbidden_token_ids=(bos_id, sep_id))
+            next_tokens = generated[:, -tokens_per_frame:]
+            tokens_reshaped = next_tokens.view(x_t.shape[0], h_code, w_code)
+            x_pred = vqvae.decode_from_indices(tokens_reshaped)
+
+        for i in range(x_t.shape[0]):
+            psnr_list.append(float(psnr_value(x_pred[i:i+1], x_tp1[i:i+1]).item()))
+            ssim_list.append(float(ssim_value(x_pred[i:i+1], x_tp1[i:i+1]).item()))
+
+        processed += 1
+        if processed >= num_batches:
+            break
+
+    return {"psnr": sum(psnr_list)/max(1,len(psnr_list)), "ssim": sum(ssim_list)/max(1,len(ssim_list))}
+
+
 def train_editor(
     data_root: str,
     vqvae_ckpt: str,
@@ -1452,6 +1537,17 @@ def parse_cli() -> argparse.Namespace:
     p_pred.add_argument("--out", type=str, default="outputs_next")
     p_pred.add_argument("--device", type=str, default="cuda")
 
+    p_eval = sub.add_parser("eval_next")
+    p_eval.add_argument("--data-root", type=str, required=True)
+    p_eval.add_argument("--vqvae", type=str, required=True)
+    p_eval.add_argument("--gpt", type=str, required=True)
+    p_eval.add_argument("--num-batches", type=int, default=10)
+    p_eval.add_argument("--image-size", type=int, default=128)
+    p_eval.add_argument("--batch-size", type=int, default=4)
+    p_eval.add_argument("--temperature", type=float, default=0.9)
+    p_eval.add_argument("--top-k", type=int, default=50)
+    p_eval.add_argument("--device", type=str, default="cuda")
+
     p_edit_train = sub.add_parser("train_editor")
     p_edit_train.add_argument("--data-root", type=str, required=True)
     p_edit_train.add_argument("--vqvae", type=str, required=True)
@@ -1545,6 +1641,19 @@ def main() -> None:
     elif args.cmd == "predict":
         predict_autoregressive(image_path=args.image, vqvae_ckpt=args.vqvae, gpt_ckpt=args.gpt, steps=args.steps, temperature=args.temperature, top_k=args.top_k, out_dir=args.out, device=args.device)
         print(f"Saved predicted frames to {args.out}")
+    elif args.cmd == "eval_next":
+        metrics = evaluate_next_frame(
+            data_root=args.data_root,
+            vqvae_ckpt=args.vqvae,
+            gpt_ckpt=args.gpt,
+            num_batches=args.num_batches,
+            image_size=args.image_size,
+            batch_size=args.batch_size,
+            temperature=args.temperature,
+            top_k=args.top_k,
+            device=args.device,
+        )
+        print({"psnr": round(metrics["psnr"], 3), "ssim": round(metrics["ssim"], 4)})
     elif args.cmd == "train_editor":
         ckpt, meta = train_editor(
             data_root=args.data_root,

@@ -195,19 +195,24 @@ class VectorQuantizer(nn.Module):
             self.register_buffer("ema_w", self.embedding.weight.data.clone())
 
     def forward(self, z_e: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        # Compute quantization in float32 to avoid NaN/Inf under AMP/FP16
+        orig_dtype = z_e.dtype
         b, c, h, w = z_e.shape
-        z_e_flat = z_e.permute(0, 2, 3, 1).contiguous().view(-1, c)
+        z_e_32 = z_e.float()
+        z_e_flat = z_e_32.permute(0, 2, 3, 1).contiguous().view(-1, c)
+        emb_w = self.embedding.weight.float()
+
         distances = (
             z_e_flat.pow(2).sum(dim=1, keepdim=True)
-            - 2 * z_e_flat @ self.embedding.weight.t()
-            + self.embedding.weight.pow(2).sum(dim=1)
+            - 2.0 * z_e_flat @ emb_w.t()
+            + emb_w.pow(2).sum(dim=1)
         )
         encoding_indices = torch.argmin(distances, dim=1)
-        z_q = self.embedding(encoding_indices).view(b, h, w, c).permute(0, 3, 1, 2).contiguous()
+        z_q_32 = F.embedding(encoding_indices, emb_w).view(b, h, w, c).permute(0, 3, 1, 2).contiguous()
 
-        commitment = self.commitment_cost * F.mse_loss(z_e.detach(), z_q)
+        commitment = self.commitment_cost * F.mse_loss(z_e_32.detach(), z_q_32)
         if self.use_ema and self.training:
-            encodings_one_hot = F.one_hot(encoding_indices, self.num_embeddings).type_as(z_e_flat)
+            encodings_one_hot = F.one_hot(encoding_indices, self.num_embeddings).to(z_e_flat.dtype)
             cluster_size = encodings_one_hot.sum(dim=0)
             self.ema_cluster_size.mul_(self.ema_decay).add_(cluster_size, alpha=1 - self.ema_decay)
             n = self.ema_cluster_size.sum()
@@ -215,15 +220,15 @@ class VectorQuantizer(nn.Module):
             embed_sum = encodings_one_hot.t() @ z_e_flat
             self.ema_w.mul_(self.ema_decay).add_(embed_sum, alpha=1 - self.ema_decay)
             self.embedding.weight.data.copy_(self.ema_w / cluster_size.unsqueeze(1))
-            codebook = torch.tensor(0.0, device=z_e.device, dtype=z_e.dtype)
+            codebook = torch.tensor(0.0, device=z_e.device, dtype=z_e_32.dtype)
         else:
-            codebook = F.mse_loss(z_e, z_q.detach())
-        vq_loss = commitment + codebook
+            codebook = F.mse_loss(z_e_32, z_q_32.detach())
+        vq_loss = (commitment + codebook).to(orig_dtype)
 
-        z_q_st = z_e + (z_q - z_e).detach()
+        z_q_st = (z_e_32 + (z_q_32 - z_e_32).detach()).to(orig_dtype)
         encodings_one_hot = F.one_hot(encoding_indices, self.num_embeddings).float()
         avg_probs = encodings_one_hot.mean(dim=0)
-        perplexity = torch.exp(-torch.sum(avg_probs * torch.log(avg_probs + 1e-10)))
+        perplexity = torch.exp(-torch.sum(avg_probs * torch.log(torch.clamp(avg_probs, min=1e-10))))
         indices = encoding_indices.view(b, h, w)
         return z_q_st, vq_loss, perplexity, indices
 
@@ -395,8 +400,8 @@ class GPTNextFrame(nn.Module):
 
 def save_image_grid(x_in: torch.Tensor, x_rec: torch.Tensor, out_dir: Path, name: str) -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
-    x_in = torch.clamp((x_in + 1.0) * 0.5, 0.0, 1.0)
-    x_rec = torch.clamp((x_rec + 1.0) * 0.5, 0.0, 1.0)
+    x_in = torch.nan_to_num(torch.clamp((x_in + 1.0) * 0.5, 0.0, 1.0))
+    x_rec = torch.nan_to_num(torch.clamp((x_rec + 1.0) * 0.5, 0.0, 1.0))
     grid = torch.cat([x_in, x_rec], dim=3)[0]
     T.ToPILImage()(grid.cpu()).save(out_dir / name)
 
@@ -408,7 +413,7 @@ def train_vqvae(data_root: str, out_path: str, image_size: int = 128, batch_size
 
     cfg = VQVAEConfig(image_size=image_size, in_channels=3, hidden_channels=hidden_channels, latent_channels=latent_channels, num_embeddings=num_embeddings, embedding_dim=embedding_dim, downsample_factor=downsample_factor, commitment_cost=0.25, use_ema=True, ema_decay=0.99)
     model = VQVAE(cfg).to(device_t)
-    scaler = torch.cuda.amp.GradScaler(enabled=(device_t.type == "cuda"))
+    scaler = torch.amp.GradScaler("cuda") if device_t.type == "cuda" else torch.amp.GradScaler("cpu")
     opt = torch.optim.Adam(model.parameters(), lr=lr)
     recon_crit = nn.L1Loss()
 
@@ -419,7 +424,7 @@ def train_vqvae(data_root: str, out_path: str, image_size: int = 128, batch_size
         for x_t, _ in pbar:
             x = x_t.to(device_t, non_blocking=True)
             last_batch_x = x
-            with torch.cuda.amp.autocast(enabled=scaler.is_enabled()):
+            with torch.amp.autocast(device_type=device_t.type, enabled=True):
                 out = model(x)
                 recon = out["recon"]
                 vq_loss = out["vq_loss"]
@@ -435,7 +440,7 @@ def train_vqvae(data_root: str, out_path: str, image_size: int = 128, batch_size
 
         # Save sample at epoch end
         if last_batch_x is not None:
-            model.eval()
+    model.eval()
             with torch.no_grad():
                 out_vis = model(last_batch_x[:4])
             save_image_grid(last_batch_x[:4], out_vis["recon"], Path("samples/vqvae"), f"epoch_{epoch:03d}.png")
@@ -473,7 +478,7 @@ def train_gpt_next(data_root: str, vqvae_ckpt: str, out_path: str, image_size: i
     gptcfg = GPTConfig(vocab_size=vocab_size, max_seq_len=max_seq_len, embed_dim=embed_dim, num_layers=layers, num_heads=heads, dropout=0.1)
     gpt = GPTNextFrame(gptcfg).to(device_t)
 
-    scaler = torch.cuda.amp.GradScaler(enabled=(device_t.type == "cuda"))
+    scaler = torch.amp.GradScaler("cuda") if device_t.type == "cuda" else torch.amp.GradScaler("cpu")
     opt = torch.optim.AdamW(gpt.parameters(), lr=lr, betas=(0.9, 0.95), weight_decay=0.01)
     ce_loss = nn.CrossEntropyLoss(ignore_index=-100)
 
@@ -499,7 +504,7 @@ def train_gpt_next(data_root: str, vqvae_ckpt: str, out_path: str, image_size: i
             seg_next = torch.ones((b, 1 + tokens_per_frame - 1), dtype=torch.long, device=device_t)
             segment_ids = torch.cat([seg_prev, seg_next], dim=1)
 
-            with torch.cuda.amp.autocast(enabled=scaler.is_enabled()):
+            with torch.amp.autocast(device_type=device_t.type, enabled=True):
                 logits = gpt(input_ids=input_ids, segment_ids=segment_ids)
                 targets = torch.full_like(input_ids, fill_value=-100)
                 targets[:, -tokens_per_frame:] = next_tokens
@@ -517,7 +522,7 @@ def train_gpt_next(data_root: str, vqvae_ckpt: str, out_path: str, image_size: i
         if last_batch is not None:
             gpt.eval()
             x_vis_t = last_batch[0][:1]
-            with torch.no_grad():
+        with torch.no_grad():
                 ids_t, _ = vqvae.encode_to_indices(x_vis_t)
             prev_tokens = ids_t.view(1, -1)
             bos = torch.full((1, 1), bos_id, dtype=torch.long, device=device_t)
@@ -646,137 +651,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-from typing import List
-
-import torch
-from PIL import Image
-from torchvision import transforms
-
-from AnimaS.models.autoencoder import AnimationAutoencoder
-from AnimaS.models.gnn import GraphCorrectionModel
-from AnimaS.models.animator import GraphSequenceModel
-from AnimaS.data.dataset import AnimationFrameDataset
-
-try:
-    from torch_geometric.data import Data as GraphData
-except ImportError:
-    GraphData = None  # type: ignore
-
-
-def load_autoencoder(model_path: str, image_size: int, num_nodes: int, num_primitives: int, latent_dim: int) -> AnimationAutoencoder:
-    model = AnimationAutoencoder(image_size=image_size, num_nodes=num_nodes, num_primitives=num_primitives, latent_dim=latent_dim)
-    state = torch.load(model_path, map_location='cpu')
-    model.load_state_dict(state)
-    model.eval()
-    return model
-
-
-def load_gnn(model_path: str, node_feat_dim: int, delta_dim: int, hidden_dim: int, num_layers: int, conv_type: str) -> GraphCorrectionModel:
-    model = GraphCorrectionModel(node_feat_dim=node_feat_dim, delta_dim=delta_dim, hidden_dim=hidden_dim, num_layers=num_layers, conv_type=conv_type)
-    state = torch.load(model_path, map_location='cpu')
-    model.load_state_dict(state)
-    model.eval()
-    return model
-
-
-def load_animator(model_path: str, num_nodes: int, input_dim: int, hidden_dim: int, num_layers: int) -> GraphSequenceModel:
-    model = GraphSequenceModel(num_nodes=num_nodes, input_dim=input_dim, hidden_dim=hidden_dim, num_layers=num_layers)
-    state = torch.load(model_path, map_location='cpu')
-    model.load_state_dict(state)
-    model.eval()
-    return model
-
-
-def main(args: argparse.Namespace) -> None:
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    # Charger l'auto‑encodeur
-    autoencoder = load_autoencoder(args.autoencoder_path, args.image_size, args.num_nodes, args.num_primitives, args.latent_dim)
-    autoencoder = autoencoder.to(device)
-    # Charger GNN (facultatif)
-    gnn = None
-    if args.gnn_path:
-        gnn = load_gnn(args.gnn_path, node_feat_dim=1, delta_dim=len(args.delta), hidden_dim=args.gnn_hidden, num_layers=args.gnn_layers, conv_type=args.gnn_conv)
-        gnn = gnn.to(device)
-    # Charger le modèle séquentiel (facultatif)
-    animator = None
-    if args.animator_path:
-        animator = load_animator(args.animator_path, num_nodes=args.num_nodes, input_dim=3, hidden_dim=args.rnn_hidden, num_layers=args.rnn_layers)
-        animator = animator.to(device)
-    # Transformer pour chargement d'image
-    transform = transforms.Compose([
-        transforms.Resize((args.image_size, args.image_size)),
-        transforms.ToTensor(),
-    ])
-    # Charger les images fournies
-    images = []
-    for img_path in args.images:
-        img = Image.open(img_path).convert('RGB')
-        img = transform(img).unsqueeze(0).to(device)
-        images.append(img)
-    # Reconstruction des images et extraction des graphes
-    graphs = []
-    recon_images = []
-    with torch.no_grad():
-        for img in images:
-            graph_data, primitives, recon = autoencoder(img)
-            # recon est shape (1,3,H,W)
-            recon_images.append(recon.squeeze(0).cpu())
-            graphs.append(graph_data)
-    # Appliquer une modification simple via GNN si demandé
-    if gnn is not None and GraphData is not None and args.delta:
-        delta = torch.tensor(args.delta, dtype=torch.float, device=device)
-        modified_graphs = []
-        for g in graphs:
-            g = g.to(device)
-            modified_graph = gnn(g, delta)
-            modified_graphs.append(modified_graph.cpu())
-        graphs = modified_graphs
-    # Prédire la suite via le modèle séquentiel si demandé et possible
-    if animator is not None and len(graphs) >= args.seq_length + 1:
-        seq_input = graphs[-args.seq_length:]
-        # Convertir GraphData en CPU
-        seq_input = [g.to(device) for g in seq_input]
-        with torch.no_grad():
-            next_graph = animator(seq_input).cpu()
-        graphs.append(next_graph)
-    # Enregistrer les images reconstruites sur disque
-    os.makedirs(args.out_dir, exist_ok=True)
-    for i, img_tensor in enumerate(recon_images):
-        out_path = os.path.join(args.out_dir, f"recon_{i:03d}.png")
-        save_image(img_tensor, out_path)
-        print(f"Image reconstruite sauvegardée dans {out_path}")
-    # Note : la reconstruction des graphes modifiés ou prédites en images nécessite
-    # un décodage depuis graphes vers primitives, qui n'est pas implémenté ici.
-
-
-def save_image(tensor: torch.Tensor, path: str) -> None:
-    """Sauvegarde un tenseur image (C,H,W) au chemin donné."""
-    img = tensor.clamp(0, 1)
-    img = transforms.ToPILImage()(img)
-    img.save(path)
-
-
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Démo ANIMA-S : reconstruction et modification")
-    parser.add_argument('--images', type=str, nargs='+', required=True, help='Chemins des images à traiter')
-    parser.add_argument('--autoencoder_path', type=str, required=True, help="Chemin du modèle d'auto‑encodeur (.pth)")
-    parser.add_argument('--gnn_path', type=str, default=None, help='Chemin du modèle GNN (.pth)')
-    parser.add_argument('--animator_path', type=str, default=None, help='Chemin du modèle séquentiel (.pth)')
-    parser.add_argument('--delta', type=float, nargs='*', default=[], help='Vecteur de commande pour la modification (delta)')
-    parser.add_argument('--image_size', type=int, default=256, help='Taille des images (carrées)')
-    parser.add_argument('--num_nodes', type=int, default=10, help='Nombre de nœuds dans le graphe')
-    parser.add_argument('--num_primitives', type=int, default=5, help='Nombre de primitives vectorielles')
-    parser.add_argument('--latent_dim', type=int, default=256, help='Dimension latente de l\'auto‑encodeur')
-    parser.add_argument('--gnn_hidden', type=int, default=64, help='Dimension cachée du GNN')
-    parser.add_argument('--gnn_layers', type=int, default=3, help='Nombre de couches du GNN')
-    parser.add_argument('--gnn_conv', type=str, default='gcn', choices=['gcn', 'graph', 'gat'], help='Type de convolution du GNN')
-    parser.add_argument('--rnn_hidden', type=int, default=128, help='Dimension cachée du modèle séquentiel')
-    parser.add_argument('--rnn_layers', type=int, default=2, help='Nombre de couches du modèle séquentiel')
-    parser.add_argument('--seq_length', type=int, default=3, help='Longueur de la séquence pour la prédiction')
-    parser.add_argument('--out_dir', type=str, default='outputs', help='Dossier de sortie pour les images reconstruites')
-    return parser.parse_args()
-
-
-if __name__ == '__main__':
-    args = parse_args()
-    main(args)
+# Legacy demo code removed to avoid ModuleNotFoundError and duplicate entry points.

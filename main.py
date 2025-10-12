@@ -26,7 +26,9 @@ import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 from PIL import Image
 import torchvision.transforms as T
+import torchvision.transforms.functional as TF
 from tqdm import tqdm
+import random
 
 
 # ------------------------------- Dataset ------------------------------------
@@ -103,6 +105,43 @@ class FramePairDataset(Dataset):
         x_t = self.transform(img_t)
         x_tp1 = self.transform(img_tp1)
         return x_t, x_tp1
+
+
+class SingleImageDataset(Dataset):
+    def __init__(
+        self,
+        root: str,
+        image_size: int = 128,
+        is_train: bool = True,
+        sequence_by_subfolder: bool = False,
+        transform: Optional[Callable[[Image.Image], torch.Tensor]] = None,
+    ) -> None:
+        super().__init__()
+        self.root = Path(root)
+        self.image_size = int(image_size)
+        self.is_train = bool(is_train)
+        self.sequence_by_subfolder = bool(sequence_by_subfolder)
+        self.transform = transform or default_transforms(self.image_size, is_train)
+
+        if not self.root.exists():
+            raise FileNotFoundError(f"Dataset root not found: {self.root}")
+
+        self.frames: List[Path] = []
+        if self.sequence_by_subfolder:
+            for sub in sorted([p for p in self.root.iterdir() if p.is_dir()]):
+                self.frames.extend(sorted([p for p in sub.iterdir() if p.is_file() and _is_image(p)]))
+        else:
+            self.frames = sorted([p for p in self.root.iterdir() if p.is_file() and _is_image(p)])
+
+        if len(self.frames) == 0:
+            raise RuntimeError(f"No images found in: {self.root}")
+
+    def __len__(self) -> int:
+        return len(self.frames)
+
+    def __getitem__(self, index: int) -> torch.Tensor:
+        img = Image.open(self.frames[index]).convert("RGB")
+        return self.transform(img)
 
 
 # ------------------------------- VQ-VAE -------------------------------------
@@ -531,6 +570,67 @@ class UNetAutoencoder(nn.Module):
         return x
 
 
+@dataclass
+class EditorUNetConfig:
+    image_size: int = 128
+    base_channels: int = 64
+    bottleneck_channels: int = 512
+    num_instructions: int = 8
+
+
+class UNetEditor(nn.Module):
+    def __init__(self, cfg: EditorUNetConfig) -> None:
+        super().__init__()
+        self.cfg = cfg
+        in_ch = 3 + 1 + cfg.num_instructions  # image + mask + instruction one-hot planes
+        c = cfg.base_channels
+        # Encoder
+        self.e1 = nn.Sequential(nn.Conv2d(in_ch, c, 3, 1, 1), nn.ReLU(inplace=True), nn.Conv2d(c, c, 3, 1, 1), nn.ReLU(inplace=True))
+        self.d1 = nn.Conv2d(c, c, 4, 2, 1)
+        self.e2 = nn.Sequential(nn.Conv2d(c, c * 2, 3, 1, 1), nn.ReLU(inplace=True), nn.Conv2d(c * 2, c * 2, 3, 1, 1), nn.ReLU(inplace=True))
+        self.d2 = nn.Conv2d(c * 2, c * 2, 4, 2, 1)
+        self.e3 = nn.Sequential(nn.Conv2d(c * 2, c * 4, 3, 1, 1), nn.ReLU(inplace=True), nn.Conv2d(c * 4, c * 4, 3, 1, 1), nn.ReLU(inplace=True))
+        self.bottleneck = nn.Sequential(nn.Conv2d(c * 4, cfg.bottleneck_channels, 3, 1, 1), nn.ReLU(inplace=True))
+
+        # Decoder
+        self.u3 = nn.ConvTranspose2d(cfg.bottleneck_channels, c * 4, 4, 2, 1)
+        self.d3 = nn.Sequential(nn.Conv2d(c * 6, c * 4, 3, 1, 1), nn.ReLU(inplace=True))
+        self.u2 = nn.ConvTranspose2d(c * 4, c * 2, 4, 2, 1)
+        self.d4 = nn.Sequential(nn.Conv2d(c * 3, c * 2, 3, 1, 1), nn.ReLU(inplace=True))
+        self.out = nn.Sequential(nn.Conv2d(c * 2, c, 3, 1, 1), nn.ReLU(inplace=True), nn.Conv2d(c, 3, 3, 1, 1), nn.Tanh())
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        s1 = self.e1(x)
+        p1 = F.relu(self.d1(s1))
+        s2 = self.e2(p1)
+        p2 = F.relu(self.d2(s2))
+        s3 = self.e3(p2)
+        b = self.bottleneck(s3)
+        x = self.u3(b)
+        x = self.d3(torch.cat([x, s2], dim=1))
+        x = self.u2(x)
+        x = self.d4(torch.cat([x, s1], dim=1))
+        x = self.out(x)
+        return x
+
+    def init_from_unet_autoencoder(self, ae_state: dict) -> None:
+        # Copy weights where shapes match exactly
+        own = self.state_dict()
+        for k, v in ae_state.items():
+            if k.startswith("e1.0.weight"):
+                # special case: first conv has extra channels
+                w = own["e1.0.weight"]
+                with torch.no_grad():
+                    w.zero_()
+                    src = v
+                    copy_ch = min(src.shape[1], 3)
+                    w[:, :copy_ch] = src[:, :copy_ch]
+                continue
+            if k in own and own[k].shape == v.shape:
+                own[k].copy_(v)
+        self.load_state_dict(own)
+
+
 def sobel_edge_loss(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
     # x,y in [-1,1]; compute gradients per-channel
     kx = torch.tensor([[1, 0, -1], [2, 0, -2], [1, 0, -1]], dtype=torch.float32, device=x.device).view(1, 1, 3, 3)
@@ -544,6 +644,80 @@ def sobel_edge_loss(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
     mag_x = torch.sqrt(gx_x ** 2 + gy_x ** 2 + 1e-6)
     mag_y = torch.sqrt(gx_y ** 2 + gy_y ** 2 + 1e-6)
     return F.l1_loss(mag_x, mag_y)
+
+
+def make_random_rect_mask(h: int, w: int) -> torch.Tensor:
+    """Return a 1xHxW binary mask with 1s in a random rectangle (possibly two)."""
+    mask = torch.zeros(1, h, w, dtype=torch.float32)
+    for _ in range(random.randint(1, 2)):
+        rh = max(8, int(random.uniform(0.2, 0.6) * h))
+        rw = max(8, int(random.uniform(0.2, 0.6) * w))
+        top = random.randint(0, max(0, h - rh))
+        left = random.randint(0, max(0, w - rw))
+        mask[:, top : top + rh, left : left + rw] = 1.0
+    return mask
+
+
+def apply_instruction_masked(x01: torch.Tensor, mask01: torch.Tensor, instr_id: int) -> torch.Tensor:
+    """Apply an edit specified by instr_id inside mask on an image tensor in [0,1].
+
+    x01: (B,C,H,W) in [0,1], mask01: (B,1,H,W) in {0,1}
+    """
+    b = x01.shape[0]
+    factor_a = random.uniform(1.1, 1.4)
+    factor_b = random.uniform(0.6, 0.9)
+    if instr_id == 0:  # brighten
+        edited = torch.clamp(x01 * factor_a, 0.0, 1.0)
+    elif instr_id == 1:  # darken
+        edited = torch.clamp(x01 * factor_b, 0.0, 1.0)
+    elif instr_id == 2:  # saturate up
+        edited = TF.adjust_saturation(x01, saturation_factor=random.uniform(1.2, 1.6))
+    elif instr_id == 3:  # desaturate
+        edited = TF.adjust_saturation(x01, saturation_factor=random.uniform(0.5, 0.8))
+    elif instr_id == 4:  # hue shift +
+        edited = TF.adjust_hue(x01, hue_factor=random.uniform(0.02, 0.12))
+    elif instr_id == 5:  # hue shift -
+        edited = TF.adjust_hue(x01, hue_factor=-random.uniform(0.02, 0.12))
+    elif instr_id == 6:  # contrast up
+        edited = TF.adjust_contrast(x01, contrast_factor=random.uniform(1.2, 1.6))
+    elif instr_id == 7:  # contrast down
+        edited = TF.adjust_contrast(x01, contrast_factor=random.uniform(0.5, 0.8))
+    else:
+        edited = x01
+    return x01 * (1.0 - mask01) + edited * mask01
+
+
+INSTRUCTION_NAMES = (
+    "brighten",
+    "darken",
+    "saturate",
+    "desaturate",
+    "hue_pos",
+    "hue_neg",
+    "contrast_up",
+    "contrast_down",
+)
+
+
+def instruction_name_to_id(name: str) -> int:
+    low = name.strip().lower()
+    if low not in INSTRUCTION_NAMES:
+        raise ValueError(f"Unknown instruction '{name}'. Allowed: {', '.join(INSTRUCTION_NAMES)}")
+    return INSTRUCTION_NAMES.index(low)
+
+
+def build_editor_condition(mask01: torch.Tensor, instr_ids: torch.Tensor, image_h: int, image_w: int, num_instr: int) -> torch.Tensor:
+    """Create per-pixel condition planes: 1 mask + one-hot instruction planes.
+
+    Returns (B, 1 + num_instr, H, W) in {0,1}.
+    """
+    b = mask01.shape[0]
+    cond = torch.zeros(b, 1 + num_instr, image_h, image_w, device=mask01.device, dtype=mask01.dtype)
+    cond[:, 0:1] = mask01
+    for i in range(b):
+        instr = int(instr_ids[i].item())
+        cond[i, 1 + instr : 1 + instr + 1] = 1.0
+    return cond
 
 def train_autoencoder_phase1(
     data_root: str,
@@ -860,6 +1034,356 @@ def predict_autoregressive(image_path: str, vqvae_ckpt: str, gpt_ckpt: str, step
         im.save(out_dir_p / f"next_{i:03d}.png")
 
 
+def train_editor(
+    data_root: str,
+    vqvae_ckpt: str,
+    out_path: str,
+    image_size: int = 128,
+    batch_size: int = 8,
+    epochs: int = 8,
+    lr: float = 3e-4,
+    embed_dim: int = 384,
+    layers: int = 6,
+    heads: int = 6,
+    device: str = "cuda",
+) -> Tuple[str, dict]:
+    device_t = torch.device(device if torch.cuda.is_available() or device == "cpu" else "cpu")
+    # Load VQ-VAE (frozen)
+    ckpt = torch.load(vqvae_ckpt, map_location="cpu")
+    vqcfg = VQVAEConfig(**ckpt["config"])  # type: ignore[arg-type]
+    vqvae = VQVAE(vqcfg).to(device_t)
+    vqvae.load_state_dict(ckpt["state_dict"])  # type: ignore[index]
+    vqvae.eval()
+
+    ds = SingleImageDataset(root=data_root, image_size=image_size, is_train=True)
+    dl = DataLoader(ds, batch_size=batch_size, shuffle=True, num_workers=4, pin_memory=True)
+
+    sample_x = next(iter(dl))
+    with torch.no_grad():
+        sample_indices, _ = vqvae.encode_to_indices(sample_x.to(device_t)[:1])
+    h_code, w_code = sample_indices.shape[-2], sample_indices.shape[-1]
+    tokens_per_frame = h_code * w_code
+
+    num_embeddings = vqcfg.num_embeddings
+    bos_id = num_embeddings
+    sep_id = num_embeddings + 1  # start of generation
+    mask0_id = num_embeddings + 2
+    mask1_id = num_embeddings + 3
+    instr_start_id = num_embeddings + 4
+    num_instr = len(INSTRUCTION_NAMES)
+    vocab_size = num_embeddings + 4 + num_instr
+
+    # Sequence = [BOS] [INSTR] prev_tokens mask_tokens [SEP] target_tokens[:-1]
+    cond_len = 1 + 1 + tokens_per_frame + tokens_per_frame + 1
+    max_seq_len = cond_len + (tokens_per_frame - 1)
+
+    gptcfg = GPTConfig(vocab_size=vocab_size, max_seq_len=max_seq_len, embed_dim=embed_dim, num_layers=layers, num_heads=heads, dropout=0.1)
+    editor = GPTNextFrame(gptcfg).to(device_t)
+
+    scaler = torch.amp.GradScaler(device_t.type)
+    opt = torch.optim.AdamW(editor.parameters(), lr=lr, betas=(0.9, 0.95), weight_decay=0.01)
+    ce_loss = nn.CrossEntropyLoss(ignore_index=-100)
+
+    last_batch_x = None
+    for epoch in range(1, epochs + 1):
+        editor.train()
+        pbar = tqdm(dl, desc=f"Editor {epoch}/{epochs}")
+        for x in pbar:
+            x = x.to(device_t, non_blocking=True)
+            last_batch_x = x
+            b, c, h, w = x.shape
+
+            # Make mask and instruction per-sample
+            masks = []
+            instr_ids = []
+            for _ in range(b):
+                masks.append(make_random_rect_mask(h, w))
+                instr_ids.append(random.randint(0, num_instr - 1))
+            mask01 = torch.stack(masks, dim=0).to(device_t)  # (B,1,H,W)
+            instr_ids_t = torch.tensor(instr_ids, dtype=torch.long, device=device_t)
+
+            # Build edited target
+            x01 = torch.clamp((x + 1.0) * 0.5, 0.0, 1.0)
+            x_edit01_list = []
+            for i in range(b):
+                x_edit01_list.append(apply_instruction_masked(x01[i:i+1], mask01[i:i+1], int(instr_ids_t[i].item())))
+            x_edit01 = torch.cat(x_edit01_list, dim=0)
+            x_edit = torch.clamp(x_edit01 * 2.0 - 1.0, -1.0, 1.0)
+
+            with torch.no_grad():
+                ids_prev, _ = vqvae.encode_to_indices(x)
+                ids_tgt, _ = vqvae.encode_to_indices(x_edit)
+
+            bsz = ids_prev.shape[0]
+            prev_tokens = ids_prev.view(bsz, -1)
+            tgt_tokens = ids_tgt.view(bsz, -1)
+
+            # Mask tokens in code grid resolution
+            with torch.no_grad():
+                mask_low = F.interpolate(mask01, size=(h_code, w_code), mode="nearest")
+            mask_flat = mask_low.view(bsz, -1)
+            mask_token_ids = torch.where(mask_flat > 0.5, torch.full_like(mask_flat, mask1_id), torch.full_like(mask_flat, mask0_id))
+
+            bos = torch.full((bsz, 1), bos_id, dtype=torch.long, device=device_t)
+            instr_tok = (instr_ids_t + instr_start_id).view(bsz, 1)
+            sep = torch.full((bsz, 1), sep_id, dtype=torch.long, device=device_t)
+
+            input_ids = torch.cat([bos, instr_tok, prev_tokens, mask_token_ids, sep, tgt_tokens[:, :-1]], dim=1)
+            seg_cond = torch.zeros((bsz, cond_len), dtype=torch.long, device=device_t)
+            seg_gen = torch.ones((bsz, tokens_per_frame - 1), dtype=torch.long, device=device_t)
+            segment_ids = torch.cat([seg_cond, seg_gen], dim=1)
+
+            with torch.amp.autocast(device_type=device_t.type, enabled=True):
+                logits = editor(input_ids=input_ids, segment_ids=segment_ids)
+                targets = torch.full_like(input_ids, fill_value=-100)
+                targets[:, -tokens_per_frame:] = tgt_tokens
+                loss = ce_loss(logits.view(-1, logits.size(-1)), targets.view(-1))
+
+            opt.zero_grad(set_to_none=True)
+            scaler.scale(loss).backward()
+            scaler.unscale_(opt)
+            torch.nn.utils.clip_grad_norm_(editor.parameters(), 1.0)
+            scaler.step(opt)
+            scaler.update()
+            pbar.set_postfix({"loss": float(loss)})
+
+        # Qualitative sample
+        if last_batch_x is not None:
+            editor.eval()
+            x_vis = last_batch_x[:1]
+            b, _, h, w = x_vis.shape
+            mask_vis = make_random_rect_mask(h, w).to(device_t).unsqueeze(0)
+            instr_vis = random.randint(0, num_instr - 1)
+            with torch.no_grad():
+                ids_prev, _ = vqvae.encode_to_indices(x_vis)
+                prev_tokens = ids_prev.view(1, -1)
+                mask_low = F.interpolate(mask_vis, size=(h_code, w_code), mode="nearest")
+                mask_flat = mask_low.view(1, -1)
+                mask_token_ids = torch.where(mask_flat > 0.5, torch.full_like(mask_flat, mask1_id), torch.full_like(mask_flat, mask0_id))
+                bos = torch.full((1, 1), bos_id, dtype=torch.long, device=device_t)
+                instr_tok = torch.full((1, 1), instr_start_id + instr_vis, dtype=torch.long, device=device_t)
+                sep = torch.full((1, 1), sep_id, dtype=torch.long, device=device_t)
+                prefix_ids = torch.cat([bos, instr_tok, prev_tokens, mask_token_ids, sep], dim=1)
+                seg_cond = torch.zeros((1, prefix_ids.shape[1]), dtype=torch.long, device=device_t)
+                generated = editor.generate(prefix_ids, seg_cond, max_new_tokens=tokens_per_frame, temperature=0.9, top_k=50, forbidden_token_ids=(bos_id, sep_id))
+                out_tokens = generated[:, -tokens_per_frame:]
+                tokens_reshaped = out_tokens.view(1, h_code, w_code)
+                x_rec = vqvae.decode_from_indices(tokens_reshaped)
+            save_image_grid(x_vis, x_rec, Path("samples/editor"), f"epoch_{epoch:03d}.png")
+
+    out_path_p = Path(out_path)
+    out_path_p.parent.mkdir(parents=True, exist_ok=True)
+    meta = {
+        "tokens_per_frame": tokens_per_frame,
+        "h_code": h_code,
+        "w_code": w_code,
+        "bos_id": bos_id,
+        "sep_id": sep_id,
+        "mask0_id": mask0_id,
+        "mask1_id": mask1_id,
+        "instr_start_id": instr_start_id,
+        "num_instr": num_instr,
+        "num_embeddings": num_embeddings,
+        "image_size": image_size,
+    }
+    torch.save({"state_dict": editor.state_dict(), "config": editor.cfg.__dict__, "meta": meta}, out_path_p)
+    return str(out_path_p), meta
+
+
+@torch.no_grad()
+def edit_image_with_model(
+    image_path: str,
+    vqvae_ckpt: str,
+    editor_ckpt: str,
+    instruction: str,
+    out_path: str = "outputs_edit/edited.png",
+    device: str = "cuda",
+) -> str:
+    device_t = torch.device(device if torch.cuda.is_available() or device == "cpu" else "cpu")
+    vq_ckpt = torch.load(vqvae_ckpt, map_location="cpu")
+    vqcfg = VQVAEConfig(**vq_ckpt["config"])  # type: ignore[arg-type]
+    vqvae = VQVAE(vqcfg).to(device_t)
+    vqvae.load_state_dict(vq_ckpt["state_dict"])  # type: ignore[index]
+    vqvae.eval()
+
+    ed_ckpt = torch.load(editor_ckpt, map_location="cpu")
+    edcfg = GPTConfig(**ed_ckpt["config"])  # type: ignore[arg-type]
+    editor = GPTNextFrame(edcfg).to(device_t)
+    editor.load_state_dict(ed_ckpt["state_dict"])  # type: ignore[index]
+    editor.eval()
+
+    meta = ed_ckpt["meta"]  # type: ignore[index]
+    tokens_per_frame = int(meta["tokens_per_frame"])  # type: ignore[index]
+    h_code = int(meta["h_code"])  # type: ignore[index]
+    w_code = int(meta["w_code"])  # type: ignore[index]
+    bos_id = int(meta["bos_id"])  # type: ignore[index]
+    sep_id = int(meta["sep_id"])  # type: ignore[index]
+    mask0_id = int(meta["mask0_id"])  # type: ignore[index]
+    mask1_id = int(meta["mask1_id"])  # type: ignore[index]
+    instr_start_id = int(meta["instr_start_id"])  # type: ignore[index]
+    num_instr = int(meta["num_instr"])  # type: ignore[index]
+    image_size = int(meta["image_size"])  # type: ignore[index]
+
+    instr_id = instruction_name_to_id(instruction)
+
+    img = Image.open(image_path).convert("RGB")
+    tfm = T.Compose([
+        T.Resize(image_size, interpolation=T.InterpolationMode.BICUBIC, antialias=True),
+        T.CenterCrop(image_size),
+        T.ToTensor(),
+        T.Normalize([0.5, 0.5, 0.5], [0.5, 0.5, 0.5]),
+    ])
+    x = tfm(img).unsqueeze(0).to(device_t)
+    ids_prev, _ = vqvae.encode_to_indices(x)
+    prev_tokens = ids_prev.view(1, -1)
+
+    # random rectangle mask at inference (can be later provided by user)
+    _, _, h, w = x.shape
+    mask = make_random_rect_mask(h, w).to(device_t).unsqueeze(0)
+    mask_low = F.interpolate(mask, size=(h_code, w_code), mode="nearest")
+    mask_flat = mask_low.view(1, -1)
+    mask_token_ids = torch.where(mask_flat > 0.5, torch.full_like(mask_flat, mask1_id), torch.full_like(mask_flat, mask0_id))
+
+    bos = torch.full((1, 1), bos_id, dtype=torch.long, device=device_t)
+    instr_tok = torch.full((1, 1), instr_start_id + instr_id, dtype=torch.long, device=device_t)
+    sep = torch.full((1, 1), sep_id, dtype=torch.long, device=device_t)
+    prefix_ids = torch.cat([bos, instr_tok, prev_tokens, mask_token_ids, sep], dim=1)
+    seg_cond = torch.zeros((1, prefix_ids.shape[1]), dtype=torch.long, device=device_t)
+    generated = editor.generate(prefix_ids, seg_cond, max_new_tokens=tokens_per_frame, temperature=0.9, top_k=50, forbidden_token_ids=(bos_id, sep_id))
+    out_tokens = generated[:, -tokens_per_frame:]
+    tokens_reshaped = out_tokens.view(1, h_code, w_code)
+    x_rec = vqvae.decode_from_indices(tokens_reshaped)
+
+    out_path_p = Path(out_path)
+    out_path_p.parent.mkdir(parents=True, exist_ok=True)
+    save_image_grid(x, x_rec, out_path_p.parent, out_path_p.name)
+    return str(out_path_p)
+
+
+def train_editor_from_ae(
+    data_root: str,
+    ae_ckpt: str,
+    out_path: str,
+    image_size: int = 128,
+    batch_size: int = 8,
+    epochs: int = 8,
+    lr: float = 1e-4,
+    base_channels: int = 64,
+    bottleneck_channels: int = 512,
+    device: str = "cuda",
+) -> str:
+    device_t = torch.device(device if torch.cuda.is_available() or device == "cpu" else "cpu")
+    # Load AE checkpoint (conv or unet)
+    ckpt = torch.load(ae_ckpt, map_location="cpu")
+    ae_cfg = AEConfig(**ckpt["config"])  # type: ignore[arg-type]
+    arch = ckpt.get("arch", "conv")
+
+    # Build editor
+    ed_cfg = EditorUNetConfig(image_size=image_size, base_channels=base_channels, bottleneck_channels=bottleneck_channels, num_instructions=len(INSTRUCTION_NAMES))
+    editor = UNetEditor(ed_cfg).to(device_t)
+
+    # Initialize from AE weights if UNet-based
+    if arch == "unet":
+        ae_model = UNetAutoencoder(ae_cfg)
+        ae_model.load_state_dict(ckpt["state_dict"])  # type: ignore[index]
+        editor.init_from_unet_autoencoder(ae_model.state_dict())
+
+    ds = SingleImageDataset(root=data_root, image_size=image_size, is_train=True)
+    dl = DataLoader(ds, batch_size=batch_size, shuffle=True, num_workers=4, pin_memory=True)
+
+    opt = torch.optim.Adam(editor.parameters(), lr=lr)
+    l1 = nn.L1Loss()
+
+    last_batch_x = None
+    editor.train()
+    for epoch in range(1, epochs + 1):
+        pbar = tqdm(dl, desc=f"EditorUNet {epoch}/{epochs}")
+        for x in pbar:
+            x = x.to(device_t, non_blocking=True)
+            last_batch_x = x
+            b, c, h, w = x.shape
+            masks = []
+            instr_ids = []
+            for _ in range(b):
+                masks.append(make_random_rect_mask(h, w))
+                instr_ids.append(random.randint(0, len(INSTRUCTION_NAMES) - 1))
+            mask01 = torch.stack(masks, dim=0).to(device_t)
+            instr_ids_t = torch.tensor(instr_ids, dtype=torch.long, device=device_t)
+
+            x01 = torch.clamp((x + 1.0) * 0.5, 0.0, 1.0)
+            x_edit01_list = []
+            for i in range(b):
+                x_edit01_list.append(apply_instruction_masked(x01[i:i+1], mask01[i:i+1], int(instr_ids_t[i].item())))
+            x_tgt = torch.clamp(torch.cat(x_edit01_list, dim=0) * 2.0 - 1.0, -1.0, 1.0)
+
+            cond = build_editor_condition(mask01, instr_ids_t, h, w, len(INSTRUCTION_NAMES))
+            inp = torch.cat([x, cond], dim=1)
+            out = editor(inp)
+
+            # Preserve outside-mask, edit inside-mask; supervise everywhere
+            loss_rec = l1(out, x_tgt)
+            loss_edge = sobel_edge_loss(out, x_tgt)
+            loss = loss_rec + 0.1 * loss_edge
+            opt.zero_grad(set_to_none=True)
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(editor.parameters(), 1.0)
+            opt.step()
+            pbar.set_postfix({"l1": float(loss_rec)})
+
+        # sample
+        if last_batch_x is not None:
+            editor.eval()
+            x_vis = last_batch_x[:1]
+            b, _, h, w = x_vis.shape
+            mask_vis = make_random_rect_mask(h, w).to(device_t).unsqueeze(0)
+            instr_vis = random.randint(0, len(INSTRUCTION_NAMES) - 1)
+            cond_vis = build_editor_condition(mask_vis, torch.tensor([instr_vis], device=device_t), h, w, len(INSTRUCTION_NAMES))
+            with torch.no_grad():
+                out_vis = editor(torch.cat([x_vis, cond_vis], dim=1))
+            save_image_grid(x_vis, out_vis, Path("samples/editor_unet"), f"epoch_{epoch:03d}.png")
+            editor.train()
+
+    out_path_p = Path(out_path)
+    out_path_p.parent.mkdir(parents=True, exist_ok=True)
+    torch.save({"state_dict": editor.state_dict(), "config": ed_cfg.__dict__}, out_path_p)
+    return str(out_path_p)
+
+
+@torch.no_grad()
+def edit_image_unet(
+    image_path: str,
+    editor_ckpt: str,
+    instruction: str,
+    out_path: str = "outputs_edit/edited_unet.png",
+    device: str = "cuda",
+) -> str:
+    device_t = torch.device(device if torch.cuda.is_available() or device == "cpu" else "cpu")
+    ckpt = torch.load(editor_ckpt, map_location="cpu")
+    cfg = EditorUNetConfig(**ckpt["config"])  # type: ignore[arg-type]
+    editor = UNetEditor(cfg).to(device_t)
+    editor.load_state_dict(ckpt["state_dict"])  # type: ignore[index]
+    editor.eval()
+
+    img = Image.open(image_path).convert("RGB")
+    tfm = T.Compose([
+        T.Resize(cfg.image_size, interpolation=T.InterpolationMode.BICUBIC, antialias=True),
+        T.CenterCrop(cfg.image_size),
+        T.ToTensor(),
+        T.Normalize([0.5, 0.5, 0.5], [0.5, 0.5, 0.5]),
+    ])
+    x = tfm(img).unsqueeze(0).to(device_t)
+    _, _, h, w = x.shape
+    mask = make_random_rect_mask(h, w).to(device_t).unsqueeze(0)
+    instr_id = instruction_name_to_id(instruction)
+    cond = build_editor_condition(mask, torch.tensor([instr_id], device=device_t), h, w, len(INSTRUCTION_NAMES))
+    out = editor(torch.cat([x, cond], dim=1))
+
+    out_path_p = Path(out_path)
+    out_path_p.parent.mkdir(parents=True, exist_ok=True)
+    save_image_grid(x, out, out_path_p.parent, out_path_p.name)
+    return str(out_path_p)
+
+
 def parse_cli() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="All-in-one: train VQ-VAE, train GPT next-frame, and predict.")
     sub = p.add_subparsers(dest="cmd", required=True)
@@ -928,6 +1452,46 @@ def parse_cli() -> argparse.Namespace:
     p_pred.add_argument("--out", type=str, default="outputs_next")
     p_pred.add_argument("--device", type=str, default="cuda")
 
+    p_edit_train = sub.add_parser("train_editor")
+    p_edit_train.add_argument("--data-root", type=str, required=True)
+    p_edit_train.add_argument("--vqvae", type=str, required=True)
+    p_edit_train.add_argument("--out", type=str, default="checkpoints/editor.pt")
+    p_edit_train.add_argument("--image-size", type=int, default=128)
+    p_edit_train.add_argument("--batch-size", type=int, default=8)
+    p_edit_train.add_argument("--epochs", type=int, default=8)
+    p_edit_train.add_argument("--lr", type=float, default=3e-4)
+    p_edit_train.add_argument("--embed-dim", type=int, default=384)
+    p_edit_train.add_argument("--layers", type=int, default=6)
+    p_edit_train.add_argument("--heads", type=int, default=6)
+    p_edit_train.add_argument("--device", type=str, default="cuda")
+
+    p_edit = sub.add_parser("edit")
+    p_edit.add_argument("--image", type=str, required=True)
+    p_edit.add_argument("--vqvae", type=str, required=True)
+    p_edit.add_argument("--editor", type=str, required=True)
+    p_edit.add_argument("--instruction", type=str, required=True, choices=list(INSTRUCTION_NAMES))
+    p_edit.add_argument("--out", type=str, default="outputs_edit/edited.png")
+    p_edit.add_argument("--device", type=str, default="cuda")
+
+    p_edit_unet_train = sub.add_parser("train_editor_from_ae")
+    p_edit_unet_train.add_argument("--data-root", type=str, required=True)
+    p_edit_unet_train.add_argument("--ae", type=str, required=True)
+    p_edit_unet_train.add_argument("--out", type=str, default="checkpoints/editor_unet.pt")
+    p_edit_unet_train.add_argument("--image-size", type=int, default=128)
+    p_edit_unet_train.add_argument("--batch-size", type=int, default=8)
+    p_edit_unet_train.add_argument("--epochs", type=int, default=8)
+    p_edit_unet_train.add_argument("--lr", type=float, default=1e-4)
+    p_edit_unet_train.add_argument("--base-channels", type=int, default=64)
+    p_edit_unet_train.add_argument("--bottleneck-channels", type=int, default=512)
+    p_edit_unet_train.add_argument("--device", type=str, default="cuda")
+
+    p_edit_unet = sub.add_parser("edit_unet")
+    p_edit_unet.add_argument("--image", type=str, required=True)
+    p_edit_unet.add_argument("--editor", type=str, required=True)
+    p_edit_unet.add_argument("--instruction", type=str, required=True, choices=list(INSTRUCTION_NAMES))
+    p_edit_unet.add_argument("--out", type=str, default="outputs_edit/edited_unet.png")
+    p_edit_unet.add_argument("--device", type=str, default="cuda")
+
     return p.parse_args()
 
 
@@ -981,6 +1545,79 @@ def main() -> None:
     elif args.cmd == "predict":
         predict_autoregressive(image_path=args.image, vqvae_ckpt=args.vqvae, gpt_ckpt=args.gpt, steps=args.steps, temperature=args.temperature, top_k=args.top_k, out_dir=args.out, device=args.device)
         print(f"Saved predicted frames to {args.out}")
+    elif args.cmd == "train_editor":
+        ckpt, meta = train_editor(
+            data_root=args.data_root,
+            vqvae_ckpt=args.vqvae,
+            out_path=args.out,
+            image_size=args.image_size,
+            batch_size=args.batch_size,
+            epochs=args.epochs,
+            lr=args.lr,
+            embed_dim=args.embed_dim,
+            layers=args.layers,
+            heads=args.heads,
+            device=args.device,
+        )
+        print(f"Saved Editor: {ckpt}")
+    elif args.cmd == "edit":
+        out = edit_image_with_model(
+            image_path=args.image,
+            vqvae_ckpt=args.vqvae,
+            editor_ckpt=args.editor,
+            instruction=args.instruction,
+            out_path=args.out,
+            device=args.device,
+        )
+        print(f"Saved edited image to {out}")
+    elif args.cmd == "train_editor_from_ae":
+        ckpt = train_editor_from_ae(
+            data_root=args.data_root,
+            ae_ckpt=args.ae,
+            out_path=args.out,
+            image_size=args.image_size,
+            batch_size=args.batch_size,
+            epochs=args.epochs,
+            lr=args.lr,
+            base_channels=args.base_channels,
+            bottleneck_channels=args.bottleneck_channels,
+            device=args.device,
+        )
+        print(f"Saved UNet Editor: {ckpt}")
+    elif args.cmd == "edit_unet":
+        out = edit_image_unet(
+            image_path=args.image,
+            editor_ckpt=args.editor,
+            instruction=args.instruction,
+            out_path=args.out,
+            device=args.device,
+        )
+        print(f"Saved edited image to {out}")
+    elif args.cmd == "train_editor":
+        ckpt, meta = train_editor(
+            data_root=args.data_root,
+            vqvae_ckpt=args.vqvae,
+            out_path=args.out,
+            image_size=args.image_size,
+            batch_size=args.batch_size,
+            epochs=args.epochs,
+            lr=args.lr,
+            embed_dim=args.embed_dim,
+            layers=args.layers,
+            heads=args.heads,
+            device=args.device,
+        )
+        print(f"Saved Editor: {ckpt}")
+    elif args.cmd == "edit":
+        out = edit_image_with_model(
+            image_path=args.image,
+            vqvae_ckpt=args.vqvae,
+            editor_ckpt=args.editor,
+            instruction=args.instruction,
+            out_path=args.out,
+            device=args.device,
+        )
+        print(f"Saved edited image to {out}")
 
 
 if __name__ == "__main__":

@@ -505,13 +505,15 @@ def train_autoencoder_phase1(
     epochs: int = 20,
     lr: float = 1e-4,
     ssim_weight: float = 0.5,
+    base_channels: int = 64,
+    bottleneck_channels: int = 512,
     device: str = "cuda",
 ) -> str:
     device_t = torch.device(device if torch.cuda.is_available() or device == "cpu" else "cpu")
     ds = FramePairDataset(root=data_root, image_size=image_size, is_train=True)
     dl = DataLoader(ds, batch_size=batch_size, shuffle=True, num_workers=4, pin_memory=True)
 
-    cfg = AEConfig(image_size=image_size, in_channels=3, base_channels=64, bottleneck_channels=512)
+    cfg = AEConfig(image_size=image_size, in_channels=3, base_channels=base_channels, bottleneck_channels=bottleneck_channels)
     model = ConvAutoencoder(cfg).to(device_t)
     opt = torch.optim.Adam(model.parameters(), lr=lr)
     l1 = nn.L1Loss()
@@ -807,6 +809,8 @@ def parse_cli() -> argparse.Namespace:
     p_ae.add_argument("--epochs", type=int, default=20)
     p_ae.add_argument("--lr", type=float, default=1e-4)
     p_ae.add_argument("--ssim-weight", type=float, default=0.5)
+    p_ae.add_argument("--base-channels", type=int, default=64)
+    p_ae.add_argument("--bottleneck-channels", type=int, default=512)
     p_ae.add_argument("--device", type=str, default="cuda")
 
     p_aep = sub.add_parser("reconstruct")
@@ -873,6 +877,8 @@ def main() -> None:
             epochs=args.epochs,
             lr=args.lr,
             ssim_weight=args.ssim_weight,
+            base_channels=args.base_channels,
+            bottleneck_channels=args.bottleneck_channels,
             device=args.device,
         )
         print(f"Saved AE: {ckpt}")

@@ -596,7 +596,9 @@ def train_autoencoder_phase1(
 
     out_path_p = Path(out_path)
     out_path_p.parent.mkdir(parents=True, exist_ok=True)
-    torch.save({"state_dict": model.state_dict(), "config": cfg.__dict__}, out_path_p)
+    # Save architecture type to allow correct loading later
+    arch = "unet" if use_unet else "conv"
+    torch.save({"state_dict": model.state_dict(), "config": cfg.__dict__, "arch": arch}, out_path_p)
     return str(out_path_p)
 
 
@@ -605,8 +607,18 @@ def reconstruct_image_phase1(image_path: str, ckpt_path: str, out_path: str, dev
     device_t = torch.device(device if torch.cuda.is_available() or device == "cpu" else "cpu")
     ckpt = torch.load(ckpt_path, map_location="cpu")
     cfg = AEConfig(**ckpt["config"])  # type: ignore[arg-type]
-    model = ConvAutoencoder(cfg).to(device_t)
-    model.load_state_dict(ckpt["state_dict"])  # type: ignore[index]
+    # Determine architecture: prefer explicit field, otherwise infer from keys
+    state_dict = ckpt["state_dict"]  # type: ignore[index]
+    arch = ckpt.get("arch", None)
+    if arch is None:
+        keys = list(state_dict.keys())
+        uses_unet = any(k.startswith("e1.") or k.startswith("bottleneck.") or k.startswith("out.") for k in keys)
+        arch = "unet" if uses_unet else "conv"
+    if arch == "unet":
+        model = UNetAutoencoder(cfg).to(device_t)
+    else:
+        model = ConvAutoencoder(cfg).to(device_t)
+    model.load_state_dict(state_dict)  # type: ignore[arg-type]
     model.eval()
 
     tfm = T.Compose([

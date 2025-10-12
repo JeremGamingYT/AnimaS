@@ -510,24 +510,24 @@ class UNetAutoencoder(nn.Module):
         self.bottleneck = nn.Sequential(nn.Conv2d(c * 4, cfg.bottleneck_channels, 3, 1, 1), nn.ReLU(inplace=True))
 
         # Decoder
-        self.u3 = nn.ConvTranspose2d(cfg.bottleneck_channels, c * 4, 4, 2, 1)
-        self.d3 = nn.Sequential(nn.Conv2d(c * 8, c * 4, 3, 1, 1), nn.ReLU(inplace=True))
-        self.u2 = nn.ConvTranspose2d(c * 4, c * 2, 4, 2, 1)
-        self.d4 = nn.Sequential(nn.Conv2d(c * 4, c * 2, 3, 1, 1), nn.ReLU(inplace=True))
-        self.u1 = nn.ConvTranspose2d(c * 2, c, 4, 2, 1)
+        self.u3 = nn.ConvTranspose2d(cfg.bottleneck_channels, c * 4, 4, 2, 1)  # 64->128
+        self.d3 = nn.Sequential(nn.Conv2d(c * 6, c * 4, 3, 1, 1), nn.ReLU(inplace=True))  # concat with s2 (2c)
+        self.u2 = nn.ConvTranspose2d(c * 4, c * 2, 4, 2, 1)  # 128->256
+        self.d4 = nn.Sequential(nn.Conv2d(c * 3, c * 2, 3, 1, 1), nn.ReLU(inplace=True))  # concat with s1 (c)
         self.out = nn.Sequential(nn.Conv2d(c * 2, c, 3, 1, 1), nn.ReLU(inplace=True), nn.Conv2d(c, cfg.in_channels, 3, 1, 1), nn.Tanh())
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        s1 = self.e1(x)
-        s2 = self.e2(F.relu(self.d1(s1)))
-        s3 = self.e3(F.relu(self.d2(s2)))
-        b = self.bottleneck(s3)
-        x = self.u3(b)
-        x = self.d3(torch.cat([x, s3], dim=1))
-        x = self.u2(x)
-        x = self.d4(torch.cat([x, s2], dim=1))
-        x = self.u1(x)
-        x = self.out(torch.cat([x, s1], dim=1))
+        s1 = self.e1(x)  # 256, c
+        p1 = F.relu(self.d1(s1))  # 128, c
+        s2 = self.e2(p1)  # 128, 2c
+        p2 = F.relu(self.d2(s2))  # 64, 2c
+        s3 = self.e3(p2)  # 64, 4c
+        b = self.bottleneck(s3)  # 64, bottleneck
+        x = self.u3(b)  # 128, 4c
+        x = self.d3(torch.cat([x, s2], dim=1))  # 128, 4c
+        x = self.u2(x)  # 256, 2c
+        x = self.d4(torch.cat([x, s1], dim=1))  # 256, 2c
+        x = self.out(x)  # 256, 3 -> tanh
         return x
 
 
@@ -691,7 +691,7 @@ def train_vqvae(
         # Save sample at epoch end
         if last_batch_x is None:
             continue
-        model.eval()
+    model.eval()
         with torch.no_grad():
             out_vis = model(last_batch_x[:4])
         save_image_grid(last_batch_x[:4], out_vis["recon"], Path("samples/vqvae"), f"epoch_{epoch:03d}.png")
@@ -773,7 +773,7 @@ def train_gpt_next(data_root: str, vqvae_ckpt: str, out_path: str, image_size: i
         if last_batch is not None:
             gpt.eval()
             x_vis_t = last_batch[0][:1]
-            with torch.no_grad():
+        with torch.no_grad():
                 ids_t, _ = vqvae.encode_to_indices(x_vis_t)
                 prev_tokens = ids_t.view(1, -1)
                 bos = torch.full((1, 1), bos_id, dtype=torch.long, device=device_t)

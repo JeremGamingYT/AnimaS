@@ -223,7 +223,8 @@ class VectorQuantizer(nn.Module):
             codebook = torch.tensor(0.0, device=z_e.device, dtype=z_e_32.dtype)
         else:
             codebook = F.mse_loss(z_e_32, z_q_32.detach())
-        vq_loss = (commitment + codebook).to(orig_dtype)
+        # Keep VQ loss in float32 for numerical stability; caller may cast if needed
+        vq_loss = commitment + codebook
 
         z_q_st = (z_e_32 + (z_q_32 - z_e_32).detach()).to(orig_dtype)
         encodings_one_hot = F.one_hot(encoding_indices, self.num_embeddings).float()
@@ -424,7 +425,8 @@ def train_vqvae(data_root: str, out_path: str, image_size: int = 128, batch_size
         for x_t, _ in pbar:
             x = x_t.to(device_t, non_blocking=True)
             last_batch_x = x
-            with torch.amp.autocast(device_type=device_t.type, enabled=True):
+            # Use full precision for stability in VQ-VAE training
+            with torch.amp.autocast(device_type=device_t.type, enabled=False):
                 out = model(x)
                 recon = out["recon"]
                 vq_loss = out["vq_loss"]

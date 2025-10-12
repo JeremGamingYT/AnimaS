@@ -180,7 +180,7 @@ class Decoder(nn.Module):
 
 
 class VectorQuantizer(nn.Module):
-    def __init__(self, num_embeddings: int, embedding_dim: int, commitment_cost: float = 0.25, use_ema: bool = True, ema_decay: float = 0.99, eps: float = 1e-5) -> None:
+    def __init__(self, num_embeddings: int, embedding_dim: int, commitment_cost: float = 0.25, use_ema: bool = True, ema_decay: float = 0.99, eps: float = 1e-5, ema_warmup_steps: int = 100, max_codebook_norm: float = 2.0) -> None:
         super().__init__()
         self.num_embeddings = int(num_embeddings)
         self.embedding_dim = int(embedding_dim)
@@ -188,11 +188,15 @@ class VectorQuantizer(nn.Module):
         self.use_ema = bool(use_ema)
         self.ema_decay = float(ema_decay)
         self.eps = float(eps)
+        self.ema_warmup_steps = int(ema_warmup_steps)
+        self.max_codebook_norm = float(max_codebook_norm)
         self.embedding = nn.Embedding(self.num_embeddings, self.embedding_dim)
         nn.init.uniform_(self.embedding.weight, -1.0 / self.num_embeddings, 1.0 / self.num_embeddings)
         if self.use_ema:
             self.register_buffer("ema_cluster_size", torch.zeros(self.num_embeddings))
             self.register_buffer("ema_w", self.embedding.weight.data.clone())
+        # Track steps to apply EMA warmup
+        self.register_buffer("_steps", torch.zeros((), dtype=torch.long))
 
     def forward(self, z_e: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         # Compute quantization in float32 to avoid NaN/Inf under AMP/FP16
@@ -211,7 +215,13 @@ class VectorQuantizer(nn.Module):
         z_q_32 = F.embedding(encoding_indices, emb_w).view(b, h, w, c).permute(0, 3, 1, 2).contiguous()
 
         commitment = self.commitment_cost * F.mse_loss(z_e_32.detach(), z_q_32)
-        if self.use_ema and self.training:
+        # Step counter for warmup
+        if self.training:
+            self._steps += 1
+
+        use_ema_now = self.use_ema and self.training and (self._steps.item() >= self.ema_warmup_steps)
+
+        if use_ema_now:
             encodings_one_hot = F.one_hot(encoding_indices, self.num_embeddings).to(z_e_flat.dtype)
             cluster_size = encodings_one_hot.sum(dim=0)
             self.ema_cluster_size.mul_(self.ema_decay).add_(cluster_size, alpha=1 - self.ema_decay)
@@ -219,10 +229,14 @@ class VectorQuantizer(nn.Module):
             cluster_size = ((self.ema_cluster_size + self.eps) / (n + self.num_embeddings * self.eps)) * n
             embed_sum = encodings_one_hot.t() @ z_e_flat
             self.ema_w.mul_(self.ema_decay).add_(embed_sum, alpha=1 - self.ema_decay)
-            self.embedding.weight.data.copy_(self.ema_w / cluster_size.unsqueeze(1))
+            updated = self.ema_w / cluster_size.unsqueeze(1)
+            # Clamp codebook values to prevent extreme scales
+            updated = torch.clamp(updated, min=-self.max_codebook_norm, max=self.max_codebook_norm)
+            self.embedding.weight.data.copy_(updated)
             codebook = torch.tensor(0.0, device=z_e.device, dtype=z_e_32.dtype)
         else:
-            codebook = F.mse_loss(z_e_32, z_q_32.detach())
+            # Non-EMA variant: update codebook with gradients
+            codebook = F.mse_loss(z_e_32.detach(), z_q_32)
         # Keep VQ loss in float32 for numerical stability; caller may cast if needed
         vq_loss = commitment + codebook
 
@@ -251,6 +265,8 @@ class VQVAEConfig:
     commitment_cost: float = 0.25
     use_ema: bool = True
     ema_decay: float = 0.99
+    ema_warmup_steps: int = 100
+    max_codebook_norm: float = 2.0
 
 
 class VQVAE(nn.Module):
@@ -269,6 +285,8 @@ class VQVAE(nn.Module):
             commitment_cost=config.commitment_cost,
             use_ema=config.use_ema,
             ema_decay=config.ema_decay,
+            ema_warmup_steps=config.ema_warmup_steps,
+            max_codebook_norm=config.max_codebook_norm,
         )
         self.proj_to_code = nn.Conv2d(config.latent_channels, config.embedding_dim, kernel_size=1)
         self.proj_from_code = nn.Conv2d(config.embedding_dim, config.latent_channels, kernel_size=1)
@@ -438,7 +456,7 @@ def train_vqvae(data_root: str, out_path: str, image_size: int = 128, batch_size
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             scaler.step(opt)
             scaler.update()
-            pbar.set_postfix({"recon": float(recon_loss), "vq": float(vq_loss)})
+            pbar.set_postfix({"recon": float(recon_loss), "vq": float(vq_loss), "perp": float(out["perplexity"])})
 
         # Save sample at epoch end
         if last_batch_x is None:

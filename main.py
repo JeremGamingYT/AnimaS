@@ -441,7 +441,7 @@ def train_vqvae(data_root: str, out_path: str, image_size: int = 128, batch_size
         # Save sample at epoch end
         if last_batch_x is None:
             continue
-        model.eval()
+    model.eval()
         with torch.no_grad():
             out_vis = model(last_batch_x[:4])
         save_image_grid(last_batch_x[:4], out_vis["recon"], Path("samples/vqvae"), f"epoch_{epoch:03d}.png")
@@ -525,17 +525,17 @@ def train_gpt_next(data_root: str, vqvae_ckpt: str, out_path: str, image_size: i
             x_vis_t = last_batch[0][:1]
         with torch.no_grad():
                 ids_t, _ = vqvae.encode_to_indices(x_vis_t)
-            prev_tokens = ids_t.view(1, -1)
-            bos = torch.full((1, 1), bos_id, dtype=torch.long, device=device_t)
-            sep = torch.full((1, 1), sep_id, dtype=torch.long, device=device_t)
-            prefix_ids = torch.cat([bos, prev_tokens, sep], dim=1)
-            seg_prev = torch.zeros((1, 1 + prev_tokens.shape[1]), dtype=torch.long, device=device_t)
-            seg_sep = torch.ones((1, 1), dtype=torch.long, device=device_t)
-            prefix_segs = torch.cat([seg_prev, seg_sep], dim=1)
-            generated = gpt.generate(prefix_ids, prefix_segs, max_new_tokens=tokens_per_frame, temperature=0.9, top_k=50, forbidden_token_ids=(bos_id, sep_id))
-            next_tokens = generated[:, -tokens_per_frame:]
-            tokens_reshaped = next_tokens.view(1, h_code, w_code)
-            x_rec = vqvae.decode_from_indices(tokens_reshaped)
+                prev_tokens = ids_t.view(1, -1)
+                bos = torch.full((1, 1), bos_id, dtype=torch.long, device=device_t)
+                sep = torch.full((1, 1), sep_id, dtype=torch.long, device=device_t)
+                prefix_ids = torch.cat([bos, prev_tokens, sep], dim=1)
+                seg_prev = torch.zeros((1, 1 + prev_tokens.shape[1]), dtype=torch.long, device=device_t)
+                seg_sep = torch.ones((1, 1), dtype=torch.long, device=device_t)
+                prefix_segs = torch.cat([seg_prev, seg_sep], dim=1)
+                generated = gpt.generate(prefix_ids, prefix_segs, max_new_tokens=tokens_per_frame, temperature=0.9, top_k=50, forbidden_token_ids=(bos_id, sep_id))
+                next_tokens = generated[:, -tokens_per_frame:]
+                tokens_reshaped = next_tokens.view(1, h_code, w_code)
+                x_rec = vqvae.decode_from_indices(tokens_reshaped)
             save_image_grid(x_vis_t, x_rec, Path("samples/next_frame"), f"epoch_{epoch:03d}.png")
 
     out_path_p = Path(out_path)

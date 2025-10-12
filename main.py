@@ -497,6 +497,54 @@ def ssim_loss_simple(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
     return (1 - ssim).mean()
 
 
+class UNetAutoencoder(nn.Module):
+    def __init__(self, cfg: AEConfig) -> None:
+        super().__init__()
+        c = cfg.base_channels
+        # Encoder
+        self.e1 = nn.Sequential(nn.Conv2d(cfg.in_channels, c, 3, 1, 1), nn.ReLU(inplace=True), nn.Conv2d(c, c, 3, 1, 1), nn.ReLU(inplace=True))
+        self.d1 = nn.Conv2d(c, c, 4, 2, 1)
+        self.e2 = nn.Sequential(nn.Conv2d(c, c * 2, 3, 1, 1), nn.ReLU(inplace=True), nn.Conv2d(c * 2, c * 2, 3, 1, 1), nn.ReLU(inplace=True))
+        self.d2 = nn.Conv2d(c * 2, c * 2, 4, 2, 1)
+        self.e3 = nn.Sequential(nn.Conv2d(c * 2, c * 4, 3, 1, 1), nn.ReLU(inplace=True), nn.Conv2d(c * 4, c * 4, 3, 1, 1), nn.ReLU(inplace=True))
+        self.bottleneck = nn.Sequential(nn.Conv2d(c * 4, cfg.bottleneck_channels, 3, 1, 1), nn.ReLU(inplace=True))
+
+        # Decoder
+        self.u3 = nn.ConvTranspose2d(cfg.bottleneck_channels, c * 4, 4, 2, 1)
+        self.d3 = nn.Sequential(nn.Conv2d(c * 8, c * 4, 3, 1, 1), nn.ReLU(inplace=True))
+        self.u2 = nn.ConvTranspose2d(c * 4, c * 2, 4, 2, 1)
+        self.d4 = nn.Sequential(nn.Conv2d(c * 4, c * 2, 3, 1, 1), nn.ReLU(inplace=True))
+        self.u1 = nn.ConvTranspose2d(c * 2, c, 4, 2, 1)
+        self.out = nn.Sequential(nn.Conv2d(c * 2, c, 3, 1, 1), nn.ReLU(inplace=True), nn.Conv2d(c, cfg.in_channels, 3, 1, 1), nn.Tanh())
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        s1 = self.e1(x)
+        s2 = self.e2(F.relu(self.d1(s1)))
+        s3 = self.e3(F.relu(self.d2(s2)))
+        b = self.bottleneck(s3)
+        x = self.u3(b)
+        x = self.d3(torch.cat([x, s3], dim=1))
+        x = self.u2(x)
+        x = self.d4(torch.cat([x, s2], dim=1))
+        x = self.u1(x)
+        x = self.out(torch.cat([x, s1], dim=1))
+        return x
+
+
+def sobel_edge_loss(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    # x,y in [-1,1]; compute gradients per-channel
+    kx = torch.tensor([[1, 0, -1], [2, 0, -2], [1, 0, -1]], dtype=torch.float32, device=x.device).view(1, 1, 3, 3)
+    ky = torch.tensor([[1, 2, 1], [0, 0, 0], [-1, -2, -1]], dtype=torch.float32, device=x.device).view(1, 1, 3, 3)
+    kx = kx.repeat(x.shape[1], 1, 1, 1)
+    ky = ky.repeat(x.shape[1], 1, 1, 1)
+    gx_x = F.conv2d(x, kx, padding=1, groups=x.shape[1])
+    gy_x = F.conv2d(x, ky, padding=1, groups=x.shape[1])
+    gx_y = F.conv2d(y, kx, padding=1, groups=y.shape[1])
+    gy_y = F.conv2d(y, ky, padding=1, groups=y.shape[1])
+    mag_x = torch.sqrt(gx_x ** 2 + gy_x ** 2 + 1e-6)
+    mag_y = torch.sqrt(gx_y ** 2 + gy_y ** 2 + 1e-6)
+    return F.l1_loss(mag_x, mag_y)
+
 def train_autoencoder_phase1(
     data_root: str,
     out_path: str,
@@ -507,6 +555,8 @@ def train_autoencoder_phase1(
     ssim_weight: float = 0.5,
     base_channels: int = 64,
     bottleneck_channels: int = 512,
+    use_unet: bool = False,
+    edge_weight: float = 0.0,
     device: str = "cuda",
 ) -> str:
     device_t = torch.device(device if torch.cuda.is_available() or device == "cpu" else "cpu")
@@ -514,7 +564,7 @@ def train_autoencoder_phase1(
     dl = DataLoader(ds, batch_size=batch_size, shuffle=True, num_workers=4, pin_memory=True)
 
     cfg = AEConfig(image_size=image_size, in_channels=3, base_channels=base_channels, bottleneck_channels=bottleneck_channels)
-    model = ConvAutoencoder(cfg).to(device_t)
+    model = (UNetAutoencoder(cfg) if use_unet else ConvAutoencoder(cfg)).to(device_t)
     opt = torch.optim.Adam(model.parameters(), lr=lr)
     l1 = nn.L1Loss()
 
@@ -528,12 +578,13 @@ def train_autoencoder_phase1(
             recon = model(x)
             loss_l1 = l1(recon, x)
             loss_ssim = ssim_loss_simple(recon, x)
-            loss = loss_l1 + ssim_weight * loss_ssim
+            loss_edge = sobel_edge_loss(recon, x) if edge_weight > 0.0 else torch.tensor(0.0, device=device_t)
+            loss = loss_l1 + ssim_weight * loss_ssim + edge_weight * loss_edge
             opt.zero_grad(set_to_none=True)
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             opt.step()
-            pbar.set_postfix({"l1": float(loss_l1), "ssim": float(loss_ssim)})
+            pbar.set_postfix({"l1": float(loss_l1), "ssim": float(loss_ssim), "edge": float(loss_edge)})
 
         if last_batch_x is None:
             continue
@@ -811,6 +862,8 @@ def parse_cli() -> argparse.Namespace:
     p_ae.add_argument("--ssim-weight", type=float, default=0.5)
     p_ae.add_argument("--base-channels", type=int, default=64)
     p_ae.add_argument("--bottleneck-channels", type=int, default=512)
+    p_ae.add_argument("--use-unet", action="store_true")
+    p_ae.add_argument("--edge-weight", type=float, default=0.0)
     p_ae.add_argument("--device", type=str, default="cuda")
 
     p_aep = sub.add_parser("reconstruct")
@@ -879,6 +932,8 @@ def main() -> None:
             ssim_weight=args.ssim_weight,
             base_channels=args.base_channels,
             bottleneck_channels=args.bottleneck_channels,
+            use_unet=args.use_unet,
+            edge_weight=args.edge_weight,
             device=args.device,
         )
         print(f"Saved AE: {ckpt}")

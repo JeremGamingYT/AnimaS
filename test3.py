@@ -3,7 +3,7 @@ import torch.nn as nn
 import torch.optim as optim
 import torch.nn.functional as F
 import numpy as np
-from PIL import Image, ImageDraw
+from PIL import Image, ImageDraw, ImageFilter
 import cv2
 import os
 from torch.utils.data import Dataset, DataLoader
@@ -11,13 +11,14 @@ import random
 from tqdm import tqdm
 import matplotlib.pyplot as plt
 from collections import deque
+import torchvision.models as models
 
 # Configuration pour optimiser la mémoire
 torch.backends.cudnn.benchmark = True
 torch.cuda.empty_cache()
 
-class DrawingEnvironment:
-    """Environnement de dessin où l'IA apprend à dessiner trait par trait"""
+class AdvancedDrawingEnvironment:
+    """Environnement de dessin avancé avec primitives variées pour dessiner des animés"""
     
     def __init__(self, canvas_size=256, max_strokes=500):
         self.canvas_size = canvas_size
@@ -25,127 +26,416 @@ class DrawingEnvironment:
         self.reset()
         
     def reset(self):
-        """Réinitialise le canvas"""
+        """Réinitialise le canvas avec des couches"""
         self.canvas = np.ones((self.canvas_size, self.canvas_size, 3), dtype=np.float32)
+        self.layers = []  # Stocke les différentes couches
         self.stroke_count = 0
-        self.pen_position = [self.canvas_size // 2, self.canvas_size // 2]
         return self.canvas.copy()
     
-    def draw_stroke(self, action):
+    def apply_primitive(self, primitive_type, params):
         """
-        Dessine un trait basé sur l'action
-        action: [x_start, y_start, x_end, y_end, thickness, r, g, b]
+        Applique une primitive de dessin
+        primitive_type: 0=bezier, 1=ellipse, 2=polygon, 3=gradient, 4=texture
         """
-        x1, y1, x2, y2, thickness, r, g, b = action
-        
-        # Convertir les coordonnées normalisées en pixels
-        x1 = int(x1 * self.canvas_size)
-        y1 = int(y1 * self.canvas_size)
-        x2 = int(x2 * self.canvas_size)
-        y2 = int(y2 * self.canvas_size)
-        thickness = max(1, int(thickness * 10))
-        
-        # Créer une image PIL pour dessiner
         img = Image.fromarray((self.canvas * 255).astype(np.uint8))
-        draw = ImageDraw.Draw(img)
+        draw = ImageDraw.Draw(img, 'RGBA')
         
-        # Dessiner le trait
-        color = (int(r * 255), int(g * 255), int(b * 255))
-        draw.line([(x1, y1), (x2, y2)], fill=color, width=thickness)
+        if primitive_type == 0:  # Courbe de Bézier complexe
+            self._draw_bezier(draw, params)
+        elif primitive_type == 1:  # Ellipse/Cercle (pour les yeux, visages)
+            self._draw_ellipse(draw, params)
+        elif primitive_type == 2:  # Polygone (pour les cheveux, vêtements)
+            self._draw_polygon(draw, params)
+        elif primitive_type == 3:  # Gradient (pour les ombres, lumières)
+            img = self._apply_gradient(img, params)
+        elif primitive_type == 4:  # Texture/Pattern
+            img = self._apply_texture(img, params)
         
-        # Mettre à jour le canvas
+        # Appliquer un léger flou pour lisser
+        if random.random() < 0.3:
+            img = img.filter(ImageFilter.GaussianBlur(radius=0.5))
+        
         self.canvas = np.array(img) / 255.0
         self.stroke_count += 1
-        self.pen_position = [x2, y2]
-        
         return self.canvas.copy()
     
-    def draw_bezier_curve(self, action):
-        """Dessine une courbe de Bézier pour des traits plus fluides"""
-        x1, y1, cx, cy, x2, y2, thickness, r, g, b = action
-        
-        # Convertir en pixels
+    def _draw_bezier(self, draw, params):
+        """Dessine une courbe de Bézier avec gradient de couleur"""
+        # params: [x1, y1, cx1, cy1, cx2, cy2, x2, y2, thickness, r1, g1, b1, r2, g2, b2, alpha]
         points = []
-        for t in np.linspace(0, 1, 20):
-            x = (1-t)**2 * x1 + 2*(1-t)*t * cx + t**2 * x2
-            y = (1-t)**2 * y1 + 2*(1-t)*t * cy + t**2 * y2
-            points.append((int(x * self.canvas_size), int(y * self.canvas_size)))
+        colors = []
         
-        # Dessiner la courbe
-        img = Image.fromarray((self.canvas * 255).astype(np.uint8))
-        draw = ImageDraw.Draw(img)
-        color = (int(r * 255), int(g * 255), int(b * 255))
-        thickness = max(1, int(thickness * 10))
+        for t in np.linspace(0, 1, 30):
+            # Points de la courbe cubique
+            x = ((1-t)**3 * params[0] + 
+                 3*(1-t)**2*t * params[2] + 
+                 3*(1-t)*t**2 * params[4] + 
+                 t**3 * params[6]) * self.canvas_size
+            y = ((1-t)**3 * params[1] + 
+                 3*(1-t)**2*t * params[3] + 
+                 3*(1-t)*t**2 * params[5] + 
+                 t**3 * params[7]) * self.canvas_size
+            points.append((int(x), int(y)))
+            
+            # Interpolation de couleur
+            r = int((params[9] * (1-t) + params[12] * t) * 255)
+            g = int((params[10] * (1-t) + params[13] * t) * 255)
+            b = int((params[11] * (1-t) + params[14] * t) * 255)
+            a = int(params[15] * 255)
+            colors.append((r, g, b, a))
         
+        thickness = max(1, int(params[8] * 15))
+        
+        # Dessiner avec variation de couleur
         for i in range(len(points) - 1):
-            draw.line([points[i], points[i+1]], fill=color, width=thickness)
-        
-        self.canvas = np.array(img) / 255.0
-        self.stroke_count += 1
-        
-        return self.canvas.copy()
-
-class StrokePredictor(nn.Module):
-    """Réseau de neurones qui prédit le prochain trait à dessiner"""
+            draw.line([points[i], points[i+1]], fill=colors[i], width=thickness)
     
-    def __init__(self, hidden_dim=512):
-        super(StrokePredictor, self).__init__()
+    def _draw_ellipse(self, draw, params):
+        """Dessine une ellipse (utile pour les yeux, visages ronds)"""
+        # params: [cx, cy, rx, ry, rotation, r, g, b, fill_r, fill_g, fill_b, alpha, fill_alpha]
+        cx = int(params[0] * self.canvas_size)
+        cy = int(params[1] * self.canvas_size)
+        rx = int(params[2] * self.canvas_size / 2)
+        ry = int(params[3] * self.canvas_size / 2)
         
-        # Encodeur CNN pour analyser l'état actuel du canvas et l'image cible
-        self.encoder = nn.Sequential(
-            nn.Conv2d(6, 32, 3, stride=2, padding=1),  # 6 canaux: 3 canvas + 3 target
-            nn.BatchNorm2d(32),
+        bbox = [cx - rx, cy - ry, cx + rx, cy + ry]
+        
+        # Couleur de remplissage
+        fill_color = (int(params[8] * 255), int(params[9] * 255), 
+                     int(params[10] * 255), int(params[12] * 255))
+        # Couleur de contour
+        outline_color = (int(params[5] * 255), int(params[6] * 255), 
+                        int(params[7] * 255), int(params[11] * 255))
+        
+        draw.ellipse(bbox, fill=fill_color, outline=outline_color, width=2)
+    
+    def _draw_polygon(self, draw, params):
+        """Dessine un polygone (pour les formes angulaires comme les cheveux)"""
+        # params: [x1, y1, x2, y2, x3, y3, x4, y4, r, g, b, alpha]
+        points = []
+        for i in range(0, 8, 2):
+            x = int(params[i] * self.canvas_size)
+            y = int(params[i+1] * self.canvas_size)
+            points.append((x, y))
+        
+        color = (int(params[8] * 255), int(params[9] * 255), 
+                int(params[10] * 255), int(params[11] * 255))
+        
+        draw.polygon(points, fill=color)
+    
+    def _apply_gradient(self, img, params):
+        """Applique un gradient pour les effets d'ombre et de lumière"""
+        # params: [x, y, radius, r1, g1, b1, r2, g2, b2, opacity]
+        overlay = Image.new('RGBA', img.size, (0, 0, 0, 0))
+        draw = ImageDraw.Draw(overlay)
+        
+        cx = int(params[0] * self.canvas_size)
+        cy = int(params[1] * self.canvas_size)
+        radius = int(params[2] * self.canvas_size / 2)
+        
+        # Créer un gradient radial
+        for r in range(radius, 0, -2):
+            alpha = int((1 - r/radius) * params[9] * 255)
+            t = r / radius
+            color = (
+                int((params[3] * t + params[6] * (1-t)) * 255),
+                int((params[4] * t + params[7] * (1-t)) * 255),
+                int((params[5] * t + params[8] * (1-t)) * 255),
+                alpha
+            )
+            draw.ellipse([cx-r, cy-r, cx+r, cy+r], fill=color)
+        
+        # Composer avec l'image originale
+        img = Image.alpha_composite(img.convert('RGBA'), overlay)
+        return img.convert('RGB')
+    
+    def _apply_texture(self, img, params):
+        """Applique une texture/pattern (pour les vêtements, arrière-plans)"""
+        # Créer un pattern simple
+        pattern = Image.new('RGBA', (20, 20), (0, 0, 0, 0))
+        draw = ImageDraw.Draw(pattern)
+        
+        # Dessiner un motif
+        color = (int(params[0] * 255), int(params[1] * 255), 
+                int(params[2] * 255), int(params[3] * 255))
+        for i in range(0, 20, 4):
+            draw.line([(0, i), (20, i)], fill=color, width=1)
+            draw.line([(i, 0), (i, 20)], fill=color, width=1)
+        
+        # Répéter le pattern
+        texture = Image.new('RGBA', img.size, (0, 0, 0, 0))
+        for x in range(0, img.width, 20):
+            for y in range(0, img.height, 20):
+                texture.paste(pattern, (x, y))
+        
+        # Appliquer avec opacité
+        img = Image.alpha_composite(img.convert('RGBA'), texture)
+        return img.convert('RGB')
+
+class ImprovedStrokePredictor(nn.Module):
+    """Réseau amélioré avec attention et compréhension de la structure"""
+    
+    def __init__(self, hidden_dim=1024):
+        super(ImprovedStrokePredictor, self).__init__()
+        
+        # Utiliser un ResNet pré-entraîné comme encodeur
+        resnet = models.resnet34(pretrained=True)
+        self.feature_extractor = nn.Sequential(*list(resnet.children())[:-2])
+        
+        # Adapter pour 6 canaux d'entrée
+        self.input_conv = nn.Conv2d(6, 64, kernel_size=7, stride=2, padding=3, bias=False)
+        
+        # Mécanisme d'attention
+        self.attention = nn.MultiheadAttention(512, num_heads=8, batch_first=True)
+        
+        # Encodeur de contexte global
+        self.context_encoder = nn.Sequential(
+            nn.AdaptiveAvgPool2d((1, 1)),
+            nn.Flatten(),
+            nn.Linear(512, hidden_dim),
             nn.ReLU(),
-            nn.Conv2d(32, 64, 3, stride=2, padding=1),
-            nn.BatchNorm2d(64),
-            nn.ReLU(),
-            nn.Conv2d(64, 128, 3, stride=2, padding=1),
-            nn.BatchNorm2d(128),
-            nn.ReLU(),
-            nn.AdaptiveAvgPool2d((8, 8))
+            nn.Dropout(0.3)
         )
         
-        # LSTM pour la mémoire des traits précédents
-        self.lstm = nn.LSTM(128 * 8 * 8, hidden_dim, num_layers=2, batch_first=True)
+        # LSTM pour la séquence de dessin
+        self.lstm = nn.LSTM(hidden_dim, hidden_dim, num_layers=3, 
+                           batch_first=True, dropout=0.3)
         
-        # Décodeur pour prédire les paramètres du prochain trait
-        self.stroke_decoder = nn.Sequential(
+        # Décodeurs pour différents types de primitives
+        self.primitive_type_head = nn.Sequential(
             nn.Linear(hidden_dim, 256),
             nn.ReLU(),
-            nn.Dropout(0.3),
-            nn.Linear(256, 128),
-            nn.ReLU(),
-            nn.Linear(128, 10)  # 10 paramètres pour une courbe de Bézier
+            nn.Linear(256, 5),  # 5 types de primitives
+            nn.Softmax(dim=-1)
         )
         
-        # Tête pour décider si continuer à dessiner
-        self.stop_head = nn.Sequential(
-            nn.Linear(hidden_dim, 64),
+        # Paramètres pour chaque primitive
+        self.bezier_decoder = nn.Sequential(
+            nn.Linear(hidden_dim, 512),
             nn.ReLU(),
-            nn.Linear(64, 1),
+            nn.Linear(512, 16),  # 16 paramètres pour Bézier
             nn.Sigmoid()
         )
         
+        self.ellipse_decoder = nn.Sequential(
+            nn.Linear(hidden_dim, 256),
+            nn.ReLU(),
+            nn.Linear(256, 13),  # 13 paramètres pour ellipse
+            nn.Sigmoid()
+        )
+        
+        self.polygon_decoder = nn.Sequential(
+            nn.Linear(hidden_dim, 256),
+            nn.ReLU(),
+            nn.Linear(256, 12),  # 12 paramètres pour polygone
+            nn.Sigmoid()
+        )
+        
+        self.gradient_decoder = nn.Sequential(
+            nn.Linear(hidden_dim, 256),
+            nn.ReLU(),
+            nn.Linear(256, 10),  # 10 paramètres pour gradient
+            nn.Sigmoid()
+        )
+        
+        self.texture_decoder = nn.Sequential(
+            nn.Linear(hidden_dim, 128),
+            nn.ReLU(),
+            nn.Linear(128, 4),  # 4 paramètres pour texture
+            nn.Sigmoid()
+        )
+        
+        # Tête pour décider quand arrêter
+        self.stop_head = nn.Sequential(
+            nn.Linear(hidden_dim, 128),
+            nn.ReLU(),
+            nn.Linear(128, 1),
+            nn.Sigmoid()
+        )
+    
     def forward(self, canvas, target, hidden=None):
-        # Concaténer canvas actuel et image cible
+        # Concaténer canvas et cible
         x = torch.cat([canvas, target], dim=1)
         
-        # Encoder
-        features = self.encoder(x)
-        features = features.view(features.size(0), 1, -1)
+        # Extraction de features
+        x = self.input_conv(x)
+        features = self.feature_extractor(x)
+        
+        # Contexte global
+        context = self.context_encoder(features)
+        context = context.unsqueeze(1)
         
         # LSTM
-        lstm_out, hidden = self.lstm(features, hidden)
+        lstm_out, hidden = self.lstm(context, hidden)
         lstm_out = lstm_out[:, -1, :]
         
-        # Prédire le prochain trait
-        stroke_params = self.stroke_decoder(lstm_out)
-        stroke_params = torch.sigmoid(stroke_params)  # Normaliser entre 0 et 1
+        # Prédire le type de primitive
+        primitive_type = self.primitive_type_head(lstm_out)
         
-        # Prédire si on doit arrêter
+        # Prédire les paramètres pour chaque primitive
+        bezier_params = self.bezier_decoder(lstm_out)
+        ellipse_params = self.ellipse_decoder(lstm_out)
+        polygon_params = self.polygon_decoder(lstm_out)
+        gradient_params = self.gradient_decoder(lstm_out)
+        texture_params = self.texture_decoder(lstm_out)
+        
+        # Probabilité d'arrêt
         stop_prob = self.stop_head(lstm_out)
         
-        return stroke_params, stop_prob, hidden
+        return {
+            'primitive_type': primitive_type,
+            'bezier': bezier_params,
+            'ellipse': ellipse_params,
+            'polygon': polygon_params,
+            'gradient': gradient_params,
+            'texture': texture_params,
+            'stop_prob': stop_prob,
+            'hidden': hidden
+        }
+
+class ImprovedDrawingAgent:
+    """Agent amélioré pour dessiner des images d'animé complexes"""
+    
+    def __init__(self, device='cuda', lr=1e-4):
+        self.device = device
+        self.env = AdvancedDrawingEnvironment()
+        self.model = ImprovedStrokePredictor().to(device)
+        self.optimizer = optim.AdamW(self.model.parameters(), lr=lr, weight_decay=1e-5)
+        self.scheduler = optim.lr_scheduler.CosineAnnealingLR(self.optimizer, T_max=100)
+        
+    def draw_image(self, target_image, max_strokes=200, training=False):
+        """Dessine une image avec des primitives variées"""
+        canvas = self.env.reset()
+        strokes = []
+        hidden = None
+        
+        canvas_tensor = torch.FloatTensor(canvas).permute(2, 0, 1).unsqueeze(0).to(self.device)
+        target_tensor = target_image.unsqueeze(0).to(self.device) if target_image.dim() == 3 else target_image
+        
+        for step in range(max_strokes):
+            # Prédiction
+            with torch.set_grad_enabled(training):
+                outputs = self.model(canvas_tensor, target_tensor, hidden)
+            
+            # Vérifier si on doit arrêter
+            if outputs['stop_prob'].item() > 0.95 and step > 30:
+                break
+            
+            # Sélectionner le type de primitive
+            primitive_type = torch.argmax(outputs['primitive_type']).item()
+            
+            # Récupérer les paramètres correspondants
+            if primitive_type == 0:
+                params = outputs['bezier'][0].cpu().detach().numpy()
+            elif primitive_type == 1:
+                params = outputs['ellipse'][0].cpu().detach().numpy()
+            elif primitive_type == 2:
+                params = outputs['polygon'][0].cpu().detach().numpy()
+            elif primitive_type == 3:
+                params = outputs['gradient'][0].cpu().detach().numpy()
+            else:
+                params = outputs['texture'][0].cpu().detach().numpy()
+            
+            # Ajouter du bruit pour l'exploration
+            if training and random.random() < 0.15:
+                params += np.random.normal(0, 0.03, params.shape)
+                params = np.clip(params, 0, 1)
+            
+            # Appliquer la primitive
+            canvas = self.env.apply_primitive(primitive_type, params)
+            strokes.append((primitive_type, params))
+            
+            # Mettre à jour le canvas
+            canvas_tensor = torch.FloatTensor(canvas).permute(2, 0, 1).unsqueeze(0).to(self.device)
+            
+            # Gérer le hidden state
+            hidden = outputs['hidden']
+            if training and hidden is not None:
+                hidden = (hidden[0].detach(), hidden[1].detach())
+        
+        return canvas, strokes
+    
+    def compute_perceptual_loss(self, drawn, target):
+        """Calcule une loss perceptuelle avec VGG"""
+        # Utiliser VGG pour la loss perceptuelle
+        vgg = models.vgg16(pretrained=True).features[:16].to(self.device).eval()
+        
+        with torch.no_grad():
+            drawn_features = vgg(drawn)
+            target_features = vgg(target)
+        
+        return F.mse_loss(drawn_features, target_features)
+    
+    def train_step(self, target_image):
+        """Entraînement avec supervision directe sur les primitives"""
+        self.model.train()
+        self.optimizer.zero_grad()
+        
+        canvas = self.env.reset()
+        canvas_tensor = torch.FloatTensor(canvas).permute(2, 0, 1).unsqueeze(0).to(self.device)
+        target_tensor = target_image.unsqueeze(0).to(self.device) if target_image.dim() == 3 else target_image
+        
+        total_loss = 0
+        hidden = None
+        num_strokes = 50
+        
+        for step in range(num_strokes):
+            outputs = self.model(canvas_tensor, target_tensor, hidden)
+            
+            # Loss sur la distribution des primitives (encourager la diversité)
+            entropy_loss = -torch.sum(outputs['primitive_type'] * 
+                                     torch.log(outputs['primitive_type'] + 1e-8))
+            
+            # Loss de régularisation sur les paramètres
+            param_loss = 0
+            for key in ['bezier', 'ellipse', 'polygon', 'gradient', 'texture']:
+                params = outputs[key]
+                # Encourager des valeurs modérées
+                param_loss += torch.mean((params - 0.5) ** 2) * 0.01
+            
+            # Loss sur la probabilité d'arrêt
+            stop_target = torch.ones_like(outputs['stop_prob']) if step < 20 else torch.zeros_like(outputs['stop_prob'])
+            stop_loss = F.binary_cross_entropy(outputs['stop_prob'], stop_target) * 0.1
+            
+            total_loss = total_loss + entropy_loss * 0.01 + param_loss + stop_loss
+            
+            # Appliquer la primitive (sans gradient)
+            with torch.no_grad():
+                primitive_type = torch.argmax(outputs['primitive_type']).item()
+                
+                if primitive_type == 0:
+                    params = outputs['bezier'][0].cpu().numpy()
+                elif primitive_type == 1:
+                    params = outputs['ellipse'][0].cpu().numpy()
+                elif primitive_type == 2:
+                    params = outputs['polygon'][0].cpu().numpy()
+                elif primitive_type == 3:
+                    params = outputs['gradient'][0].cpu().numpy()
+                else:
+                    params = outputs['texture'][0].cpu().numpy()
+                
+                canvas = self.env.apply_primitive(primitive_type, params)
+                canvas_tensor = torch.FloatTensor(canvas).permute(2, 0, 1).unsqueeze(0).to(self.device)
+            
+            hidden = outputs['hidden']
+        
+        # Loss de reconstruction finale
+        with torch.no_grad():
+            drawn_tensor = torch.FloatTensor(canvas).permute(2, 0, 1).unsqueeze(0).to(self.device)
+            reconstruction_loss = F.mse_loss(drawn_tensor, target_tensor).item()
+            
+            # Loss perceptuelle
+            perceptual_loss = self.compute_perceptual_loss(drawn_tensor, target_tensor).item()
+        
+        # Ajouter les losses de reconstruction
+        total_loss = total_loss + reconstruction_loss + perceptual_loss * 0.1
+        
+        # Backpropagation
+        total_loss.backward()
+        torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
+        self.optimizer.step()
+        
+        return total_loss.item(), canvas
 
 class AnimeDataset(Dataset):
     """Dataset pour charger les images d'animé"""
@@ -172,115 +462,6 @@ class AnimeDataset(Dataset):
         image = np.array(image) / 255.0
         return torch.FloatTensor(image).permute(2, 0, 1)
 
-class DrawingAgent:
-    """Agent qui apprend à dessiner"""
-    
-    def __init__(self, device='cuda', lr=1e-4):
-        self.device = device
-        self.env = DrawingEnvironment()
-        self.model = StrokePredictor().to(device)
-        self.optimizer = optim.Adam(self.model.parameters(), lr=lr)
-        self.memory = deque(maxlen=10000)
-        
-    def draw_image(self, target_image, max_strokes=300, training=False):
-        """Dessine une image trait par trait"""
-        canvas = self.env.reset()
-        strokes = []
-        hidden = None
-        
-        canvas_tensor = torch.FloatTensor(canvas).permute(2, 0, 1).unsqueeze(0).to(self.device)
-        target_tensor = target_image.unsqueeze(0).to(self.device) if target_image.dim() == 3 else target_image
-        
-        for step in range(max_strokes):
-            # Prédire le prochain trait
-            with torch.set_grad_enabled(training):
-                stroke_params, stop_prob, hidden = self.model(canvas_tensor, target_tensor, hidden)
-            
-            # Décider si arrêter
-            if stop_prob.item() > 0.95 and step > 50:
-                break
-            
-            # Extraire les paramètres du trait
-            params = stroke_params[0].cpu().detach().numpy()
-            
-            # Ajouter du bruit pendant l'entraînement (exploration)
-            if training and random.random() < 0.1:
-                params += np.random.normal(0, 0.05, params.shape)
-                params = np.clip(params, 0, 1)
-            
-            # Dessiner le trait
-            canvas = self.env.draw_bezier_curve(params)
-            strokes.append(params)
-            
-            # Mettre à jour le tensor canvas
-            canvas_tensor = torch.FloatTensor(canvas).permute(2, 0, 1).unsqueeze(0).to(self.device)
-            
-            # Détacher le hidden state pour éviter l'accumulation de gradient
-            if training and hidden is not None:
-                hidden = (hidden[0].detach(), hidden[1].detach())
-        
-        return canvas, strokes
-    
-    def compute_loss(self, drawn_image, target_image, stroke_params_list=None):
-        """Calcule la perte entre l'image dessinée et la cible"""
-        drawn_tensor = torch.FloatTensor(drawn_image).permute(2, 0, 1).to(self.device)
-        
-        # Perte L2 pixel-wise (sans gradient car drawn_image vient de numpy)
-        with torch.no_grad():
-            l2_loss = F.mse_loss(drawn_tensor, target_image)
-        
-        # Pour maintenir le gradient, on doit utiliser les paramètres du modèle directement
-        # Créer une loss artificielle qui a un gradient
-        dummy_loss = torch.tensor(l2_loss.item(), requires_grad=True, device=self.device)
-        
-        return dummy_loss
-    
-    def train_step(self, target_image):
-        """Un pas d'entraînement"""
-        self.model.train()
-        self.optimizer.zero_grad()
-        
-        # Pour garder la chaîne de gradient, on va directement optimiser les sorties du modèle
-        canvas = self.env.reset()
-        canvas_tensor = torch.FloatTensor(canvas).permute(2, 0, 1).unsqueeze(0).to(self.device)
-        target_tensor = target_image.unsqueeze(0).to(self.device) if target_image.dim() == 3 else target_image
-        
-        # Prédire plusieurs traits et accumuler la loss
-        total_loss = 0
-        hidden = None
-        num_strokes = 50  # Nombre de traits à prédire
-        
-        for _ in range(num_strokes):
-            stroke_params, stop_prob, hidden = self.model(canvas_tensor, target_tensor, hidden)
-            
-            # Loss sur les paramètres directement (supervision directe)
-            # On encourage le modèle à produire des paramètres cohérents
-            param_loss = torch.mean(stroke_params ** 2) * 0.01  # Régularisation
-            stop_loss = F.binary_cross_entropy(stop_prob, torch.zeros_like(stop_prob)) * 0.01
-            
-            total_loss = total_loss + param_loss + stop_loss
-            
-            # Simuler le dessin (sans gradient)
-            with torch.no_grad():
-                params = stroke_params[0].cpu().numpy()
-                canvas = self.env.draw_bezier_curve(params)
-                canvas_tensor = torch.FloatTensor(canvas).permute(2, 0, 1).unsqueeze(0).to(self.device)
-        
-        # Ajouter une loss de reconstruction finale
-        with torch.no_grad():
-            drawn_tensor = torch.FloatTensor(canvas).permute(2, 0, 1).to(self.device)
-            reconstruction_error = F.mse_loss(drawn_tensor, target_image).item()
-        
-        # La loss finale combine les losses intermédiaires
-        total_loss = total_loss + reconstruction_error
-        
-        # Backpropagation
-        total_loss.backward()
-        torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
-        self.optimizer.step()
-        
-        return total_loss.item(), canvas
-
 def train_drawing_ai(dataset_path, epochs=100, batch_size=4):
     """Fonction principale d'entraînement"""
     
@@ -293,7 +474,7 @@ def train_drawing_ai(dataset_path, epochs=100, batch_size=4):
     dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True, num_workers=2, pin_memory=True)
     
     # Créer l'agent
-    agent = DrawingAgent(device=device)
+    agent = ImprovedDrawingAgent(device=device)
     
     # Entraînement
     losses = []
@@ -321,6 +502,9 @@ def train_drawing_ai(dataset_path, epochs=100, batch_size=4):
             # Sauvegarder un exemple toutes les 50 batches
             if batch_idx % 50 == 0:
                 save_example(target_images[0], drawn, epoch, batch_idx)
+        
+        # Scheduler
+        agent.scheduler.step()
         
         # Statistiques de l'epoch
         avg_epoch_loss = np.mean(epoch_losses)
@@ -356,29 +540,15 @@ def save_example(target, drawn, epoch, batch):
     plt.savefig(f'examples/epoch_{epoch}_batch_{batch}.png')
     plt.close()
 
-def generate_new_drawing(agent, prompt_image=None):
-    """Génère un nouveau dessin"""
-    agent.model.eval()
-    
-    if prompt_image is None:
-        # Créer une image aléatoire comme cible
-        prompt_image = torch.rand(3, 256, 256).to(agent.device)
-    
-    with torch.no_grad():
-        drawn_image, strokes = agent.draw_image(prompt_image, training=False)
-    
-    return drawn_image, strokes
-
-# Fonction d'utilisation
 def main():
     # Créer les dossiers nécessaires
     os.makedirs('examples', exist_ok=True)
     
-    # Chemin vers votre dataset d'images d'animé
-    DATASET_PATH = "/kaggle/input/anima-s-dataset/test"  # Remplacez par votre chemin
+    # Chemin vers votre dataset
+    DATASET_PATH = "/kaggle/input/anima-s-dataset/test/"
     
     # Entraîner l'IA
-    print("Démarrage de l'entraînement de l'IA de dessin...")
+    print("Démarrage de l'entraînement de l'IA de dessin avancée...")
     agent, losses = train_drawing_ai(DATASET_PATH, epochs=50, batch_size=2)
     
     # Afficher la courbe de perte
@@ -391,17 +561,6 @@ def main():
     plt.show()
     
     print("Entraînement terminé!")
-    
-    # Générer quelques exemples
-    print("Génération d'exemples...")
-    for i in range(5):
-        drawn, _ = generate_new_drawing(agent)
-        plt.figure(figsize=(8, 8))
-        plt.imshow(drawn)
-        plt.title(f'Dessin généré #{i+1}')
-        plt.axis('off')
-        plt.savefig(f'generated_{i+1}.png')
-        plt.show()
 
 if __name__ == "__main__":
     main()

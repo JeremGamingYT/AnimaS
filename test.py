@@ -2,906 +2,349 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
-import torchvision.transforms as transforms
-import torchvision.models as models
-from torch.cuda.amp import autocast, GradScaler
-from PIL import Image
 import numpy as np
+from PIL import Image
 import os
 from pathlib import Path
+import matplotlib.pyplot as plt
 from tqdm import tqdm
-import cv2
-import random
-import gc
-import json
-from einops import rearrange
-from einops.layers.torch import Rearrange
-import torch.nn.functional as F
 
-# ==================== Configuration pour Haute Qualité ====================
-class Config:
-    # Chemins
-    FRAMES_DIR = "/kaggle/input/anima-s-dataset/test/"
-    CHECKPOINT_DIR = "checkpoints"
-    OUTPUT_DIR = "predictions"
+# ==================== 1. GÉNÉRATION DE DONNÉES SYNTHÉTIQUES ====================
+def generate_synthetic_data(num_sequences=1000, frames_per_seq=5, img_size=64, save_dir="data/frames"):
+    """
+    Génère des séquences d'images synthétiques (balle qui bouge)
+    """
+    os.makedirs(save_dir, exist_ok=True)
     
-    # Hyperparamètres - Optimisés pour 12GB VRAM
-    SEQUENCE_LENGTH = 3
-    IMG_SIZE = (128, 128)  # Réduit de 256 à 128
-    PATCH_SIZE = (32, 32)  # Réduit de 64 à 32
-    BATCH_SIZE = 1
-    GRADIENT_ACCUMULATION_STEPS = 4  # Réduit de 8 à 4
-    LEARNING_RATE_G = 0.0001
-    LEARNING_RATE_D = 0.00005
-    LEARNING_RATE_R = 0.0001
-    NUM_EPOCHS = 300
-    DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    
-    # Architecture - Réduite
-    HIDDEN_DIM = 128  # Réduit de 256 à 128
-    NUM_LAYERS = 2
-    
-    # Loss weights
-    RECONSTRUCTION_WEIGHT = 50.0
-    L1_WEIGHT = 100.0
-    PERCEPTUAL_WEIGHT = 10.0  # Réduit de 20 à 10
-    TEXTURE_WEIGHT = 5.0  # Réduit de 10 à 5
-    EDGE_WEIGHT = 5.0
-    GAN_WEIGHT = 1.0
-    SSIM_WEIGHT = 10.0
-    
-    # Training
-    USE_MIXED_PRECISION = True
-    CLIP_GRAD_NORM = 1.0
-    USE_PROGRESSIVE_TRAINING = True
+    for seq_idx in tqdm(range(num_sequences), desc="Génération des données"):
+        # Position et vitesse aléatoires
+        x, y = np.random.randint(10, img_size-10), np.random.randint(10, img_size-10)
+        vx, vy = np.random.randint(-5, 6), np.random.randint(-5, 6)
+        color = np.random.rand(3)
+        
+        seq_dir = os.path.join(save_dir, f"seq_{seq_idx:04d}")
+        os.makedirs(seq_dir, exist_ok=True)
+        
+        for frame_idx in range(frames_per_seq):
+            # Créer l'image
+            img = np.zeros((img_size, img_size, 3))
+            
+            # Dessiner un cercle
+            y_grid, x_grid = np.ogrid[:img_size, :img_size]
+            mask = (x_grid - x)**2 + (y_grid - y)**2 <= 25
+            img[mask] = color
+            
+            # Sauvegarder
+            img_pil = Image.fromarray((img * 255).astype(np.uint8))
+            img_pil.save(os.path.join(seq_dir, f"frame_{frame_idx:04d}.png"))
+            
+            # Mettre à jour la position
+            x, y = x + vx, y + vy
+            
+            # Rebondir sur les bords
+            if x <= 5 or x >= img_size - 5:
+                vx = -vx
+            if y <= 5 or y >= img_size - 5:
+                vy = -vy
+            
+            x = np.clip(x, 5, img_size - 5)
+            y = np.clip(y, 5, img_size - 5)
 
-# ==================== Module de Super-Résolution ====================
-class ResidualBlock(nn.Module):
-    """Block résiduel pour la super-résolution"""
-    def __init__(self, channels):
-        super().__init__()
-        self.conv1 = nn.Conv2d(channels, channels, 3, padding=1)
-        self.bn1 = nn.BatchNorm2d(channels)
-        self.relu = nn.ReLU(inplace=True)
-        self.conv2 = nn.Conv2d(channels, channels, 3, padding=1)
-        self.bn2 = nn.BatchNorm2d(channels)
-    
-    def forward(self, x):
-        residual = x
-        out = self.relu(self.bn1(self.conv1(x)))
-        out = self.bn2(self.conv2(out))
-        out += residual
-        return self.relu(out)
-
-class QualityRefinementModule(nn.Module):
-    """Module pour raffiner la qualité des images générées"""
-    def __init__(self, in_channels=3, num_blocks=4):  # Réduit de 8 à 4
-        super().__init__()
-        
-        # Extraction de features multi-échelle
-        self.initial = nn.Sequential(
-            nn.Conv2d(in_channels, 32, 9, padding=4),  # Réduit de 64 à 32
-            nn.ReLU(inplace=True)
-        )
-        
-        # Residual blocks pour capturer les détails
-        self.res_blocks = nn.Sequential(*[ResidualBlock(32) for _ in range(num_blocks)])
-        
-        # Reconstruction haute qualité
-        self.reconstruction = nn.Sequential(
-            nn.Conv2d(32, 32, 3, padding=1),
-            nn.BatchNorm2d(32),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(32, in_channels, 9, padding=4),
-            nn.Tanh()
-        )
-    
-    def forward(self, x):
-        initial_features = self.initial(x)
-        res_features = self.res_blocks(initial_features)
-        refined = self.reconstruction(res_features + initial_features)
-        return refined
-
-# ==================== Générateur avec Auto-Encoder et Raffinement ====================
-class HighQualityGenerator(nn.Module):
-    """Générateur avec reconstruction haute qualité et prédiction"""
-    def __init__(self, config):
-        super().__init__()
-        self.config = config
-        
-        # ========== ENCODER (Partagé) - Dimensions réduites ==========
-        self.encoder = nn.ModuleList([
-            # Level 1: 128 -> 64
-            nn.Sequential(
-                nn.Conv2d(3, 32, 4, 2, 1),  # Réduit de 64 à 32
-                nn.BatchNorm2d(32),
-                nn.LeakyReLU(0.2),
-            ),
-            # Level 2: 64 -> 32
-            nn.Sequential(
-                nn.Conv2d(32, 64, 4, 2, 1),  # Réduit de 128 à 64
-                nn.BatchNorm2d(64),
-                nn.LeakyReLU(0.2),
-            ),
-            # Level 3: 32 -> 16
-            nn.Sequential(
-                nn.Conv2d(64, 128, 4, 2, 1),  # Réduit de 256 à 128
-                nn.BatchNorm2d(128),
-                nn.LeakyReLU(0.2),
-            ),
-            # Level 4: 16 -> 8
-            nn.Sequential(
-                nn.Conv2d(128, 256, 4, 2, 1),  # Réduit de 512 à 256
-                nn.BatchNorm2d(256),
-                nn.LeakyReLU(0.2),
-            )
-        ])
-        
-        # ========== TEMPORAL MODULE - Réduit ==========
-        self.temporal_module = nn.LSTM(
-            input_size=256 * 8 * 8,  # Adapté aux nouvelles dimensions
-            hidden_size=512,  # Réduit de 2048 à 512
-            num_layers=2,
-            batch_first=True
-        )
-        
-        # Projection layer
-        self.temporal_projection = nn.Linear(512, 256 * 8 * 8)
-        
-        # ========== RECONSTRUCTION DECODER ==========
-        self.reconstruction_decoder = nn.ModuleList([
-            # Level 4: 8 -> 16
-            nn.Sequential(
-                nn.ConvTranspose2d(256, 128, 4, 2, 1),
-                nn.BatchNorm2d(128),
-                nn.ReLU(),
-            ),
-            # Level 3: 16 -> 32
-            nn.Sequential(
-                nn.ConvTranspose2d(128 + 128, 64, 4, 2, 1),
-                nn.BatchNorm2d(64),
-                nn.ReLU(),
-            ),
-            # Level 2: 32 -> 64
-            nn.Sequential(
-                nn.ConvTranspose2d(64 + 64, 32, 4, 2, 1),
-                nn.BatchNorm2d(32),
-                nn.ReLU(),
-            ),
-            # Level 1: 64 -> 128
-            nn.Sequential(
-                nn.ConvTranspose2d(32 + 32, 16, 4, 2, 1),
-                nn.BatchNorm2d(16),
-                nn.ReLU(),
-                nn.Conv2d(16, 3, 3, 1, 1),
-                nn.Tanh()
-            )
-        ])
-        
-        # ========== PREDICTION DECODER ==========
-        self.prediction_decoder = nn.ModuleList([
-            nn.Sequential(
-                nn.ConvTranspose2d(256, 128, 4, 2, 1),
-                nn.BatchNorm2d(128),
-                nn.ReLU(),
-            ),
-            nn.Sequential(
-                nn.ConvTranspose2d(128, 64, 4, 2, 1),
-                nn.BatchNorm2d(64),
-                nn.ReLU(),
-            ),
-            nn.Sequential(
-                nn.ConvTranspose2d(64, 32, 4, 2, 1),
-                nn.BatchNorm2d(32),
-                nn.ReLU(),
-            ),
-            nn.Sequential(
-                nn.ConvTranspose2d(32, 16, 4, 2, 1),
-                nn.BatchNorm2d(16),
-                nn.ReLU(),
-                nn.Conv2d(16, 3, 3, 1, 1),
-                nn.Tanh()
-            )
-        ])
-        
-        # ========== QUALITY REFINEMENT - Simplifié ==========
-        self.quality_refiner = QualityRefinementModule(in_channels=3, num_blocks=4)  # Réduit de 6 à 4
-        
-        # ========== DETAIL ENHANCEMENT - Simplifié ==========
-        self.detail_enhancer = nn.Sequential(
-            nn.Conv2d(6, 16, 3, 1, 1),  # Réduit de 32 à 16
-            nn.ReLU(),
-            nn.Conv2d(16, 3, 3, 1, 1),
-            nn.Tanh()
-        )
-    
-    def encode_frame(self, frame):
-        """Encoder une frame avec skip connections"""
-        skip_connections = []
-        x = frame
-        
-        for encoder_layer in self.encoder:
-            x = encoder_layer(x)
-            skip_connections.append(x)
-        
-        return x, skip_connections
-    
-    def decode_reconstruction(self, features, skip_connections):
-        """Décoder pour reconstruire l'image originale"""
-        x = features
-        
-        # Premier décodage sans skip
-        x = self.reconstruction_decoder[0](x)
-        
-        # Décodages suivants avec skip connections
-        for i in range(1, len(self.reconstruction_decoder)):
-            if i < len(skip_connections):
-                # Ajouter la skip connection
-                skip = skip_connections[-(i+1)]
-                x = torch.cat([x, skip], dim=1)
-            x = self.reconstruction_decoder[i](x)
-        
-        return x
-    
-    def decode_prediction(self, features):
-        """Décoder pour prédire la frame suivante"""
-        x = features
-        
-        for decoder_layer in self.prediction_decoder:
-            x = decoder_layer(x)
-        
-        return x
-    
-    def forward(self, x, return_all=False):
-        batch_size, seq_len, c, h, w = x.size()
-        
-        # ========== PHASE 1: ENCODER + RECONSTRUCTION ==========
-        encoded_features = []
-        reconstructions = []
-        all_skip_connections = []
-        
-        for t in range(seq_len):
-            features, skip_connections = self.encode_frame(x[:, t])
-            encoded_features.append(features)
-            all_skip_connections.append(skip_connections)
-            
-            # Reconstruire seulement si nécessaire pour économiser la mémoire
-            if return_all and t == seq_len - 1:  # Seulement la dernière
-                reconstruction = self.decode_reconstruction(features, skip_connections)
-                reconstruction = self.quality_refiner(reconstruction)
-                reconstructions.append(reconstruction)
-        
-        # ========== PHASE 2: TEMPORAL PROCESSING ==========
-        # Flatten et process temporel
-        flattened_features = []
-        for feat in encoded_features:
-            flattened = feat.view(batch_size, -1)
-            flattened_features.append(flattened)
-        
-        temporal_input = torch.stack(flattened_features, dim=1)
-        
-        # Clear unused tensors
-        del encoded_features
-        torch.cuda.empty_cache()
-        
-        temporal_output, _ = self.temporal_module(temporal_input)
-        
-        # Prendre la dernière sortie temporelle et projeter
-        last_temporal = temporal_output[:, -1]
-        last_temporal = self.temporal_projection(last_temporal)
-        last_temporal = last_temporal.view(batch_size, 256, 8, 8)
-        
-        # Clear unused tensors
-        del temporal_output, temporal_input
-        torch.cuda.empty_cache()
-        
-        # ========== PHASE 3: PREDICTION ==========
-        predicted_frame = self.decode_prediction(last_temporal)
-        
-        # ========== PHASE 4: QUALITY REFINEMENT ==========
-        refined_prediction = self.quality_refiner(predicted_frame)
-        
-        # ========== PHASE 5: DETAIL ENHANCEMENT ==========
-        last_input_frame = x[:, -1]
-        combined = torch.cat([refined_prediction, last_input_frame], dim=1)
-        final_prediction = self.detail_enhancer(combined)
-        
-        # Fusion finale avec résiduel
-        final_prediction = 0.7 * refined_prediction + 0.3 * final_prediction
-        
-        if return_all:
-            return final_prediction, reconstructions
-        return final_prediction
-
-# ==================== Discriminateur Multi-Échelle ====================
-class MultiScaleDiscriminator(nn.Module):
-    """Discriminateur multi-échelle pour juger la qualité à différents niveaux"""
-    def __init__(self):
-        super().__init__()
-        
-        # Discriminateur pour détails fins (haute résolution)
-        self.fine_discriminator = nn.Sequential(
-            nn.Conv2d(6, 64, 4, 2, 1),
-            nn.LeakyReLU(0.2),
-            nn.Conv2d(64, 128, 4, 2, 1),
-            nn.InstanceNorm2d(128),
-            nn.LeakyReLU(0.2),
-            nn.Conv2d(128, 256, 4, 2, 1),
-            nn.InstanceNorm2d(256),
-            nn.LeakyReLU(0.2),
-            nn.Conv2d(256, 512, 4, 2, 1),
-            nn.InstanceNorm2d(512),
-            nn.LeakyReLU(0.2),
-            nn.Conv2d(512, 1, 4, 1, 1)
-        )
-        
-        # Discriminateur pour structure globale (basse résolution)
-        self.coarse_discriminator = nn.Sequential(
-            nn.AvgPool2d(2),  # Downsample
-            nn.Conv2d(6, 32, 4, 2, 1),
-            nn.LeakyReLU(0.2),
-            nn.Conv2d(32, 64, 4, 2, 1),
-            nn.InstanceNorm2d(64),
-            nn.LeakyReLU(0.2),
-            nn.Conv2d(64, 128, 4, 2, 1),
-            nn.InstanceNorm2d(128),
-            nn.LeakyReLU(0.2),
-            nn.Conv2d(128, 1, 4, 1, 1)
-        )
-    
-    def forward(self, input_frame, target):
-        if len(input_frame.shape) == 5:
-            input_frame = input_frame[:, -1]
-        
-        combined = torch.cat([input_frame, target], dim=1)
-        
-        fine_output = self.fine_discriminator(combined)
-        coarse_output = self.coarse_discriminator(combined)
-        
-        return [fine_output, coarse_output]
-
-# ==================== Loss Functions Avancées ====================
-class EdgeLoss(nn.Module):
-    """Loss pour préserver les contours nets"""
-    def __init__(self):
-        super().__init__()
-        # Sobel filters
-        self.sobel_x = nn.Conv2d(1, 1, 3, padding=1, bias=False)
-        self.sobel_y = nn.Conv2d(1, 1, 3, padding=1, bias=False)
-        
-        sobel_x_kernel = torch.tensor([[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]], dtype=torch.float32).view(1, 1, 3, 3)
-        sobel_y_kernel = torch.tensor([[-1, -2, -1], [0, 0, 0], [1, 2, 1]], dtype=torch.float32).view(1, 1, 3, 3)
-        
-        self.sobel_x.weight = nn.Parameter(sobel_x_kernel, requires_grad=False)
-        self.sobel_y.weight = nn.Parameter(sobel_y_kernel, requires_grad=False)
-    
-    def forward(self, pred, target):
-        # Move filters to the same device and dtype as input
-        self.sobel_x = self.sobel_x.to(pred.device)
-        self.sobel_y = self.sobel_y.to(pred.device)
-        self.sobel_x.weight.data = self.sobel_x.weight.data.to(pred.dtype)
-        self.sobel_y.weight.data = self.sobel_y.weight.data.to(pred.dtype)
-        
-        # Convert to grayscale
-        pred_gray = 0.299 * pred[:, 0:1] + 0.587 * pred[:, 1:2] + 0.114 * pred[:, 2:3]
-        target_gray = 0.299 * target[:, 0:1] + 0.587 * target[:, 1:2] + 0.114 * target[:, 2:3]
-        
-        # Compute edges
-        pred_edge_x = self.sobel_x(pred_gray)
-        pred_edge_y = self.sobel_y(pred_gray)
-        pred_edges = torch.sqrt(pred_edge_x**2 + pred_edge_y**2)
-        
-        target_edge_x = self.sobel_x(target_gray)
-        target_edge_y = self.sobel_y(target_gray)
-        target_edges = torch.sqrt(target_edge_x**2 + target_edge_y**2)
-        
-        return F.l1_loss(pred_edges, target_edges)
-
-class TextureLoss(nn.Module):
-    """Loss pour préserver les textures et détails fins"""
-    def __init__(self, device):
-        super().__init__()
-        # Utiliser VGG pour extraire les features de texture
-        vgg = models.vgg19(pretrained=True).features
-        self.layers = nn.ModuleList([
-            vgg[:4],   # Conv1_2
-            vgg[4:9],  # Conv2_2
-            vgg[9:14]  # Conv3_2
-        ]).to(device).eval()
-        
-        for p in self.parameters():
-            p.requires_grad = False
-    
-    def gram_matrix(self, x):
-        b, c, h, w = x.size()
-        features = x.view(b, c, h * w)
-        gram = torch.bmm(features, features.transpose(1, 2))
-        return gram / (c * h * w)
-    
-    def forward(self, pred, target):
-        loss = 0
-        
-        # Normaliser pour VGG
-        mean = torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1).to(pred.device)
-        std = torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1).to(pred.device)
-        
-        pred = (pred + 1) / 2
-        target = (target + 1) / 2
-        pred = (pred - mean) / std
-        target = (target - mean) / std
-        
-        for layer in self.layers:
-            pred = layer(pred)
-            target = layer(target)
-            
-            pred_gram = self.gram_matrix(pred)
-            target_gram = self.gram_matrix(target)
-            
-            loss += F.l1_loss(pred_gram, target_gram)
-        
-        return loss
-
-class SSIMLoss(nn.Module):
-    """Structural Similarity Index Loss"""
-    def __init__(self, window_size=11, size_average=True):
-        super().__init__()
-        self.window_size = window_size
-        self.size_average = size_average
-        self.channel = 3
-        self.window = self.create_window(window_size, self.channel)
-    
-    def gaussian(self, window_size, sigma):
-        gauss = torch.Tensor([np.exp(-(x - window_size//2)**2/float(2*sigma**2)) for x in range(window_size)])
-        return gauss/gauss.sum()
-    
-    def create_window(self, window_size, channel):
-        _1D_window = self.gaussian(window_size, 1.5).unsqueeze(1)
-        _2D_window = _1D_window.mm(_1D_window.t()).float().unsqueeze(0).unsqueeze(0)
-        window = _2D_window.expand(channel, 1, window_size, window_size).contiguous()
-        return window
-    
-    def forward(self, img1, img2):
-        channel = img1.size()[1]
-        
-        if channel == self.channel and self.window.data.type() == img1.data.type():
-            window = self.window
-        else:
-            window = self.create_window(self.window_size, channel)
-            window = window.type_as(img1)
-            self.window = window
-            self.channel = channel
-        
-        mu1 = F.conv2d(img1, window, padding=self.window_size//2, groups=channel)
-        mu2 = F.conv2d(img2, window, padding=self.window_size//2, groups=channel)
-        
-        mu1_sq = mu1.pow(2)
-        mu2_sq = mu2.pow(2)
-        mu1_mu2 = mu1 * mu2
-        
-        sigma1_sq = F.conv2d(img1*img1, window, padding=self.window_size//2, groups=channel) - mu1_sq
-        sigma2_sq = F.conv2d(img2*img2, window, padding=self.window_size//2, groups=channel) - mu2_sq
-        sigma12 = F.conv2d(img1*img2, window, padding=self.window_size//2, groups=channel) - mu1_mu2
-        
-        C1 = 0.01**2
-        C2 = 0.03**2
-        
-        ssim_map = ((2*mu1_mu2 + C1)*(2*sigma12 + C2))/((mu1_sq + mu2_sq + C1)*(sigma1_sq + sigma2_sq + C2))
-        
-        if self.size_average:
-            return 1 - ssim_map.mean()
-        else:
-            return 1 - ssim_map.mean(1).mean(1).mean(1)
-
-# ==================== Trainer Haute Qualité ====================
-class HighQualityTrainer:
-    def __init__(self, generator, discriminator, config):
-        self.generator = generator.to(config.DEVICE)
-        self.discriminator = discriminator.to(config.DEVICE)
-        self.config = config
-        
-        # Optimizers
-        self.optimizer_G = optim.AdamW(
-            generator.parameters(),
-            lr=config.LEARNING_RATE_G,
-            betas=(0.5, 0.999),
-            weight_decay=0.01
-        )
-        self.optimizer_D = optim.AdamW(
-            discriminator.parameters(),
-            lr=config.LEARNING_RATE_D,
-            betas=(0.5, 0.999),
-            weight_decay=0.01
-        )
-        
-        # Losses
-        self.criterion_GAN = nn.BCEWithLogitsLoss()
-        self.criterion_L1 = nn.L1Loss()
-        self.criterion_L2 = nn.MSELoss()
-        
-        # Advanced losses
-        from torchvision.models import vgg19
-        self.perceptual_loss = self.setup_perceptual_loss()
-        self.edge_loss = EdgeLoss()
-        self.texture_loss = TextureLoss(config.DEVICE)
-        self.ssim_loss = SSIMLoss()
-        
-        # Mixed precision
-        self.scaler_G = GradScaler()
-        self.scaler_D = GradScaler()
-        
-        # Metrics
-        self.metrics = {
-            'g_losses': [],
-            'd_losses': [],
-            'reconstruction_losses': [],
-            'prediction_losses': [],
-            'quality_scores': []
-        }
-        
-        os.makedirs(config.CHECKPOINT_DIR, exist_ok=True)
-        os.makedirs(config.OUTPUT_DIR, exist_ok=True)
-    
-    def setup_perceptual_loss(self):
-        """Setup VGG perceptual loss"""
-        vgg = models.vgg19(pretrained=True).features[:23].to(self.config.DEVICE).eval()
-        for p in vgg.parameters():
-            p.requires_grad = False
-        return vgg
-    
-    def compute_perceptual_loss(self, pred, target):
-        """Compute perceptual loss using VGG features"""
-        # Normalize
-        mean = torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1).to(pred.device)
-        std = torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1).to(pred.device)
-        
-        pred = (pred + 1) / 2
-        target = (target + 1) / 2
-        pred = (pred - mean) / std
-        target = (target - mean) / std
-        
-        pred_features = self.perceptual_loss(pred)
-        target_features = self.perceptual_loss(target)
-        
-        return F.l1_loss(pred_features, target_features)
-    
-    def train_discriminator(self, real_batch, input_frames):
-        self.optimizer_D.zero_grad()
-        
-        with autocast():
-            # Generate fake
-            with torch.no_grad():
-                fake_batch, _ = self.generator(input_frames, return_all=True)
-            
-            # Get multi-scale outputs
-            real_outputs = self.discriminator(input_frames, real_batch)
-            fake_outputs = self.discriminator(input_frames, fake_batch)
-            
-            d_loss = 0
-            for real_out, fake_out in zip(real_outputs, fake_outputs):
-                real_labels = torch.ones_like(real_out) * 0.9
-                fake_labels = torch.zeros_like(fake_out) + 0.1
-                
-                d_loss += self.criterion_GAN(real_out, real_labels)
-                d_loss += self.criterion_GAN(fake_out, fake_labels)
-            
-            d_loss = d_loss / (2 * len(real_outputs))
-        
-        self.scaler_D.scale(d_loss).backward()
-        self.scaler_D.step(self.optimizer_D)
-        self.scaler_D.update()
-        
-        return d_loss.item()
-    
-    def train_generator(self, input_frames, target_frame):
-        self.optimizer_G.zero_grad()
-        
-        with autocast():
-            # Generate with reconstructions
-            predicted_frame, reconstructions = self.generator(input_frames, return_all=True)
-            
-            # ========== RECONSTRUCTION LOSS ==========
-            # Comparer les reconstructions avec les frames originales
-            reconstruction_loss = 0
-            for t in range(len(reconstructions)):
-                original_frame = input_frames[:, t]
-                reconstructed_frame = reconstructions[t]
-                
-                # L1 + L2 pour reconstruction parfaite
-                reconstruction_loss += self.criterion_L1(reconstructed_frame, original_frame)
-                reconstruction_loss += 0.5 * self.criterion_L2(reconstructed_frame, original_frame)
-                
-                # SSIM pour la structure
-                reconstruction_loss += self.config.SSIM_WEIGHT * self.ssim_loss(
-                    reconstructed_frame, original_frame
-                )
-            
-            reconstruction_loss = reconstruction_loss / len(reconstructions)
-            
-            # ========== PREDICTION LOSSES ==========
-            # L1 Loss
-            l1_loss = self.criterion_L1(predicted_frame, target_frame)
-            
-            # Perceptual Loss
-            perceptual_loss = self.compute_perceptual_loss(predicted_frame, target_frame)
-            
-            # Edge Loss (pour les contours nets)
-            edge_loss = self.edge_loss(predicted_frame, target_frame)
-            
-            # Texture Loss (pour les détails)
-            texture_loss = self.texture_loss(predicted_frame, target_frame)
-            
-            # SSIM Loss
-            ssim_loss = self.ssim_loss(predicted_frame, target_frame)
-            
-            # ========== GAN LOSS ==========
-            fake_outputs = self.discriminator(input_frames, predicted_frame)
-            gan_loss = 0
-            for fake_out in fake_outputs:
-                real_labels = torch.ones_like(fake_out)
-                gan_loss += self.criterion_GAN(fake_out, real_labels)
-            gan_loss = gan_loss / len(fake_outputs)
-            
-            # ========== TOTAL LOSS ==========
-            g_loss = (
-                self.config.RECONSTRUCTION_WEIGHT * reconstruction_loss +
-                self.config.L1_WEIGHT * l1_loss +
-                self.config.PERCEPTUAL_WEIGHT * perceptual_loss +
-                self.config.EDGE_WEIGHT * edge_loss +
-                self.config.TEXTURE_WEIGHT * texture_loss +
-                self.config.SSIM_WEIGHT * ssim_loss +
-                self.config.GAN_WEIGHT * gan_loss
-            )
-        
-        self.scaler_G.scale(g_loss).backward()
-        
-        # Gradient clipping
-        self.scaler_G.unscale_(self.optimizer_G)
-        torch.nn.utils.clip_grad_norm_(self.generator.parameters(), self.config.CLIP_GRAD_NORM)
-        
-        self.scaler_G.step(self.optimizer_G)
-        self.scaler_G.update()
-        
-        return {
-            'total': g_loss.item(),
-            'reconstruction': reconstruction_loss.item(),
-            'l1': l1_loss.item(),
-            'perceptual': perceptual_loss.item(),
-            'edge': edge_loss.item(),
-            'texture': texture_loss.item(),
-            'ssim': ssim_loss.item(),
-            'gan': gan_loss.item()
-        }
-    
-    def train_epoch(self, dataloader, epoch):
-        self.generator.train()
-        self.discriminator.train()
-        
-        epoch_g_loss = 0
-        epoch_d_loss = 0
-        epoch_reconstruction_loss = 0
-        
-        with tqdm(dataloader, desc=f"Epoch {epoch+1}") as pbar:
-            for batch_idx, (input_frames, target_frame) in enumerate(pbar):
-                input_frames = input_frames.to(self.config.DEVICE)
-                target_frame = target_frame.to(self.config.DEVICE)
-                
-                # Train Discriminator
-                if batch_idx % 2 == 0:
-                    d_loss = self.train_discriminator(target_frame, input_frames)
-                    epoch_d_loss += d_loss
-                
-                # Train Generator
-                g_losses = self.train_generator(input_frames, target_frame)
-                epoch_g_loss += g_losses['total']
-                epoch_reconstruction_loss += g_losses['reconstruction']
-                
-                # Update progress
-                pbar.set_postfix({
-                    'G': f"{g_losses['total']:.3f}",
-                    'Recon': f"{g_losses['reconstruction']:.3f}",
-                    'L1': f"{g_losses['l1']:.3f}",
-                    'Edge': f"{g_losses['edge']:.3f}",
-                    'SSIM': f"{g_losses['ssim']:.3f}"
+# ==================== 2. DATASET ====================
+class VideoSequenceDataset(Dataset):
+    """
+    Dataset pour les séquences d'images
+    """
+    def __init__(self, data_dir, context_length=2, img_size=64):
+        self.data_dir = data_dir
+        self.context_length = context_length
+        self.img_size = img_size
+        
+        # Trouver toutes les séquences
+        self.sequences = sorted([d for d in Path(data_dir).iterdir() if d.is_dir()])
+        self.samples = []
+        
+        for seq_dir in self.sequences:
+            frames = sorted(list(seq_dir.glob("*.png")))
+            # Créer des échantillons avec context_length images en entrée + 1 en sortie
+            for i in range(len(frames) - context_length):
+                self.samples.append({
+                    'input_frames': frames[i:i+context_length],
+                    'target_frame': frames[i+context_length]
                 })
-                
-                # Clear memory periodically
-                if batch_idx % 10 == 0:
-                    torch.cuda.empty_cache()
-        
-        return (
-            epoch_g_loss / len(dataloader),
-            epoch_d_loss / max(1, len(dataloader) // 2),
-            epoch_reconstruction_loss / len(dataloader)
-        )
-    
-    def visualize_results(self, dataloader, epoch):
-        self.generator.eval()
-        
-        with torch.no_grad():
-            data = next(iter(dataloader))
-            input_frames = data[0][:1].to(self.config.DEVICE)
-            target_frame = data[1][:1].to(self.config.DEVICE)
-            
-            with autocast():
-                predicted_frame, reconstructions = self.generator(input_frames, return_all=True)
-            
-            # Helper function
-            def tensor_to_image(tensor):
-                img = tensor[0].cpu().numpy()
-                img = (img + 1) / 2
-                img = np.transpose(img, (1, 2, 0))
-                img = np.clip(img * 255, 0, 255).astype(np.uint8)
-                return cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
-            
-            # Create comparison grid
-            images = []
-            
-            # Original input
-            input_img = tensor_to_image(input_frames[:, -1])
-            images.append(input_img)
-            
-            # Reconstruction of input
-            if reconstructions:
-                recon_img = tensor_to_image(reconstructions[-1])
-                images.append(recon_img)
-            
-            # Target
-            target_img = tensor_to_image(target_frame)
-            images.append(target_img)
-            
-            # Prediction
-            pred_img = tensor_to_image(predicted_frame)
-            images.append(pred_img)
-            
-            # Stack images
-            top_row = np.hstack(images[:2]) if len(images) > 2 else images[0]
-            bottom_row = np.hstack(images[2:]) if len(images) > 2 else images[1]
-            grid = np.vstack([top_row, bottom_row])
-            
-            # Add labels
-            font = cv2.FONT_HERSHEY_SIMPLEX
-            cv2.putText(grid, "Input", (10, 30), font, 1, (255, 255, 255), 2)
-            cv2.putText(grid, "Reconstruction", (266, 30), font, 1, (255, 255, 255), 2)
-            cv2.putText(grid, "Target", (10, 286), font, 1, (255, 255, 255), 2)
-            cv2.putText(grid, "Prediction", (266, 286), font, 1, (255, 255, 255), 2)
-            
-            save_path = os.path.join(self.config.OUTPUT_DIR, f'epoch_{epoch+1}.png')
-            cv2.imwrite(save_path, grid)
-            print(f"📸 Visualisation: {save_path}")
-            
-            # Clear memory
-            torch.cuda.empty_cache()
-    
-    def train(self, train_loader, val_loader=None):
-        print(f"🚀 High Quality Training on {self.config.DEVICE}")
-        print(f"📊 Focus on: Reconstruction + Prediction Quality")
-        
-        best_val_loss = float('inf')
-        
-        for epoch in range(self.config.NUM_EPOCHS):
-            print(f"\n{'='*60}")
-            print(f"📅 Epoch {epoch+1}/{self.config.NUM_EPOCHS}")
-            
-            # Training
-            g_loss, d_loss, recon_loss = self.train_epoch(train_loader, epoch)
-            
-            self.metrics['g_losses'].append(g_loss)
-            self.metrics['d_losses'].append(d_loss)
-            self.metrics['reconstruction_losses'].append(recon_loss)
-            
-            print(f"📊 Generator Loss: {g_loss:.4f}")
-            print(f"📊 Discriminator Loss: {d_loss:.4f}")
-            print(f"📊 Reconstruction Loss: {recon_loss:.4f}")
-            
-            # Visualize
-            if (epoch + 1) % 5 == 0:
-                self.visualize_results(train_loader, epoch)
-            
-            # Save checkpoint
-            if (epoch + 1) % 20 == 0:
-                self.save_checkpoint(epoch, g_loss, d_loss)
-            
-            # Save metrics
-            if (epoch + 1) % 10 == 0:
-                with open(os.path.join(self.config.OUTPUT_DIR, 'metrics.json'), 'w') as f:
-                    json.dump(self.metrics, f, indent=2)
-    
-    def save_checkpoint(self, epoch, g_loss, d_loss):
-        checkpoint = {
-            'epoch': epoch,
-            'generator_state_dict': self.generator.state_dict(),
-            'discriminator_state_dict': self.discriminator.state_dict(),
-            'g_loss': g_loss,
-            'd_loss': d_loss
-        }
-        
-        path = os.path.join(
-            self.config.CHECKPOINT_DIR,
-            f'checkpoint_epoch_{epoch}_quality.pth'
-        )
-        torch.save(checkpoint, path)
-        print(f"✅ Checkpoint saved: {path}")
-
-# ==================== Dataset ====================
-class QualityAnimeDataset(Dataset):
-    def __init__(self, frames_dir, sequence_length=3, img_size=(256, 256)):
-        self.frames_dir = Path(frames_dir)
-        self.sequence_length = sequence_length
-        
-        self.transform = transforms.Compose([
-            transforms.Resize(img_size),
-            transforms.ToTensor(),
-            transforms.Normalize([0.5, 0.5, 0.5], [0.5, 0.5, 0.5])
-        ])
-        
-        self.frame_paths = sorted(self.frames_dir.glob("frame_*.png"))
-        self.num_sequences = len(self.frame_paths) - sequence_length
     
     def __len__(self):
-        return self.num_sequences
+        return len(self.samples)
     
     def __getitem__(self, idx):
-        input_frames = []
+        sample = self.samples[idx]
         
-        for i in range(self.sequence_length):
-            frame = Image.open(self.frame_paths[idx + i]).convert('RGB')
-            frame = self.transform(frame)
-            input_frames.append(frame)
+        # Charger les images d'entrée
+        input_imgs = []
+        for frame_path in sample['input_frames']:
+            img = Image.open(frame_path).resize((self.img_size, self.img_size))
+            img = np.array(img).astype(np.float32) / 255.0
+            input_imgs.append(img)
         
-        target_frame = Image.open(self.frame_paths[idx + self.sequence_length]).convert('RGB')
-        target_frame = self.transform(target_frame)
+        # Charger l'image cible
+        target_img = Image.open(sample['target_frame']).resize((self.img_size, self.img_size))
+        target_img = np.array(target_img).astype(np.float32) / 255.0
         
-        return torch.stack(input_frames), target_frame
+        # Convertir en tenseurs (B, C, H, W)
+        input_imgs = torch.FloatTensor(np.array(input_imgs)).permute(0, 3, 1, 2)
+        target_img = torch.FloatTensor(target_img).permute(2, 0, 1)
+        
+        return input_imgs, target_img
 
-# ==================== Main ====================
+# ==================== 3. MODÈLE DE TOKENISATION (VQ-VAE simplifié) ====================
+class ImageTokenizer(nn.Module):
+    """
+    Encode les images en tokens discrets (comme un tokenizer de texte)
+    """
+    def __init__(self, img_size=64, patch_size=8, embed_dim=256):
+        super().__init__()
+        self.patch_size = patch_size
+        self.num_patches = (img_size // patch_size) ** 2
+        
+        # Encoder : Image -> Embeddings
+        self.encoder = nn.Sequential(
+            nn.Conv2d(3, 64, 4, 2, 1),  # 64x64 -> 32x32
+            nn.ReLU(),
+            nn.Conv2d(64, 128, 4, 2, 1),  # 32x32 -> 16x16
+            nn.ReLU(),
+            nn.Conv2d(128, 256, 4, 2, 1),  # 16x16 -> 8x8
+            nn.ReLU(),
+            nn.Conv2d(256, embed_dim, 3, 1, 1),
+        )
+        
+        # Decoder : Embeddings -> Image
+        self.decoder = nn.Sequential(
+            nn.ConvTranspose2d(embed_dim, 256, 3, 1, 1),
+            nn.ReLU(),
+            nn.ConvTranspose2d(256, 128, 4, 2, 1),  # 8x8 -> 16x16
+            nn.ReLU(),
+            nn.ConvTranspose2d(128, 64, 4, 2, 1),  # 16x16 -> 32x32
+            nn.ReLU(),
+            nn.ConvTranspose2d(64, 3, 4, 2, 1),  # 32x32 -> 64x64
+            nn.Sigmoid()
+        )
+    
+    def encode(self, x):
+        return self.encoder(x)
+    
+    def decode(self, z):
+        return self.decoder(z)
+    
+    def forward(self, x):
+        z = self.encode(x)
+        x_recon = self.decode(z)
+        return x_recon, z
+
+# ==================== 4. MODÈLE TRANSFORMER (type GPT) ====================
+class PositionalEncoding(nn.Module):
+    def __init__(self, d_model, max_len=1000):
+        super().__init__()
+        pe = torch.zeros(max_len, d_model)
+        position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
+        div_term = torch.exp(torch.arange(0, d_model, 2).float() * (-np.log(10000.0) / d_model))
+        pe[:, 0::2] = torch.sin(position * div_term)
+        pe[:, 1::2] = torch.cos(position * div_term)
+        self.register_buffer('pe', pe)
+    
+    def forward(self, x):
+        return x + self.pe[:x.size(1), :].unsqueeze(0)
+
+class VideoGPT(nn.Module):
+    """
+    Modèle type GPT pour prédire la prochaine image
+    """
+    def __init__(self, embed_dim=256, num_heads=8, num_layers=6, img_size=64):
+        super().__init__()
+        self.embed_dim = embed_dim
+        
+        # Tokenizer d'images
+        self.tokenizer = ImageTokenizer(img_size=img_size, embed_dim=embed_dim)
+        
+        # Positional encoding
+        self.pos_encoder = PositionalEncoding(embed_dim * 64)
+        
+        # Transformer Encoder
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=embed_dim * 64, 
+            nhead=num_heads,
+            dim_feedforward=embed_dim * 128,
+            batch_first=True
+        )
+        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+        
+        # Projection pour décoder
+        self.projection = nn.Linear(embed_dim * 64, embed_dim * 64)
+    
+    def forward(self, input_frames):
+        """
+        input_frames: (batch, num_frames, 3, H, W)
+        """
+        batch_size, num_frames, C, H, W = input_frames.shape
+        
+        # Encoder chaque frame
+        encoded_frames = []
+        for i in range(num_frames):
+            _, z = self.tokenizer(input_frames[:, i])  # (B, embed_dim, 8, 8)
+            z = z.flatten(1)  # (B, embed_dim * 64)
+            encoded_frames.append(z)
+        
+        # Stack les frames encodés
+        encoded_seq = torch.stack(encoded_frames, dim=1)  # (B, num_frames, embed_dim*64)
+        
+        # Positional encoding
+        encoded_seq = self.pos_encoder(encoded_seq)
+        
+        # Transformer
+        transformed = self.transformer(encoded_seq)  # (B, num_frames, embed_dim*64)
+        
+        # Prendre la dernière sortie pour prédire la prochaine frame
+        next_frame_encoding = self.projection(transformed[:, -1])  # (B, embed_dim*64)
+        
+        # Reshape et décoder
+        next_frame_encoding = next_frame_encoding.view(batch_size, self.embed_dim, 8, 8)
+        predicted_frame = self.tokenizer.decode(next_frame_encoding)
+        
+        return predicted_frame
+
+# ==================== 5. ENTRAÎNEMENT ====================
+def train_model(model, train_loader, num_epochs=50, lr=1e-4, device='cuda'):
+    """
+    Entraîne le modèle de prédiction d'images
+    """
+    model = model.to(device)
+    optimizer = optim.Adam(model.parameters(), lr=lr)
+    criterion = nn.MSELoss()
+    
+    history = {'train_loss': []}
+    
+    for epoch in range(num_epochs):
+        model.train()
+        epoch_loss = 0
+        
+        pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{num_epochs}")
+        for input_frames, target_frame in pbar:
+            input_frames = input_frames.to(device)
+            target_frame = target_frame.to(device)
+            
+            # Forward pass
+            predicted_frame = model(input_frames)
+            loss = criterion(predicted_frame, target_frame)
+            
+            # Backward pass
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+            
+            epoch_loss += loss.item()
+            pbar.set_postfix({'loss': loss.item()})
+        
+        avg_loss = epoch_loss / len(train_loader)
+        history['train_loss'].append(avg_loss)
+        print(f"Epoch {epoch+1}/{num_epochs} - Loss: {avg_loss:.6f}")
+    
+    return history
+
+# ==================== 6. PRÉDICTION ET VISUALISATION ====================
+def predict_next_frame(model, input_frames, device='cuda'):
+    """
+    Prédit la prochaine image
+    """
+    model.eval()
+    with torch.no_grad():
+        input_frames = input_frames.unsqueeze(0).to(device)
+        predicted_frame = model(input_frames)
+    return predicted_frame.cpu().squeeze(0)
+
+def visualize_prediction(input_frames, target_frame, predicted_frame):
+    """
+    Visualise les résultats
+    """
+    num_inputs = input_frames.shape[0]
+    
+    fig, axes = plt.subplots(1, num_inputs + 2, figsize=(15, 3))
+    
+    # Images d'entrée
+    for i in range(num_inputs):
+        axes[i].imshow(input_frames[i].permute(1, 2, 0).numpy())
+        axes[i].set_title(f"Input Frame {i+1}")
+        axes[i].axis('off')
+    
+    # Image cible
+    axes[num_inputs].imshow(target_frame.permute(1, 2, 0).numpy())
+    axes[num_inputs].set_title("Target (Ground Truth)")
+    axes[num_inputs].axis('off')
+    
+    # Image prédite
+    axes[num_inputs + 1].imshow(predicted_frame.permute(1, 2, 0).numpy())
+    axes[num_inputs + 1].set_title("Predicted")
+    axes[num_inputs + 1].axis('off')
+    
+    plt.tight_layout()
+    plt.savefig("prediction_result.png", dpi=150, bbox_inches='tight')
+    plt.show()
+
+# ==================== 7. FONCTION PRINCIPALE ====================
 def main():
-    config = Config()
+    # Configuration
+    IMG_SIZE = 64
+    CONTEXT_LENGTH = 2  # Nombre d'images en entrée
+    BATCH_SIZE = 16
+    NUM_EPOCHS = 30
+    DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
     
-    # Set CUDA optimization
-    os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True'
-    torch.cuda.empty_cache()
+    print(f"🚀 Utilisation du device: {DEVICE}")
     
-    print("🎨 High Quality Anime Frame Prediction")
-    print("✨ Focus: Reconstruction Quality + Prediction Accuracy")
-    print(f"📊 Device: {config.DEVICE}")
+    # 1. Générer les données
+    print("\n📊 Génération des données synthétiques...")
+    generate_synthetic_data(num_sequences=500, frames_per_seq=5, img_size=IMG_SIZE)
     
-    # Dataset
-    print("\n📁 Loading dataset...")
-    dataset = QualityAnimeDataset(
-        frames_dir=config.FRAMES_DIR,
-        sequence_length=config.SEQUENCE_LENGTH,
-        img_size=config.IMG_SIZE
-    )
+    # 2. Créer le dataset
+    print("\n📦 Création du dataset...")
+    dataset = VideoSequenceDataset("data/frames", context_length=CONTEXT_LENGTH, img_size=IMG_SIZE)
+    train_loader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=0)
+    print(f"   Nombre d'échantillons: {len(dataset)}")
     
-    # DataLoader
-    dataloader = DataLoader(
-        dataset,
-        batch_size=config.BATCH_SIZE,
-        shuffle=True,
-        num_workers=0,
-        pin_memory=False
-    )
+    # 3. Créer le modèle
+    print("\n🧠 Création du modèle VideoGPT...")
+    model = VideoGPT(embed_dim=256, num_heads=8, num_layers=4, img_size=IMG_SIZE)
+    total_params = sum(p.numel() for p in model.parameters())
+    print(f"   Nombre de paramètres: {total_params:,}")
     
-    print(f"📊 Dataset: {len(dataset)} sequences")
+    # 4. Entraîner
+    print("\n🏋️ Début de l'entraînement...")
+    history = train_model(model, train_loader, num_epochs=NUM_EPOCHS, lr=1e-4, device=DEVICE)
     
-    # Models
-    print("\n🤖 Creating models...")
-    generator = HighQualityGenerator(config)
-    discriminator = MultiScaleDiscriminator()
+    # 5. Sauvegarder le modèle
+    print("\n💾 Sauvegarde du modèle...")
+    torch.save(model.state_dict(), "video_gpt_model.pth")
     
-    # Count parameters
-    g_params = sum(p.numel() for p in generator.parameters())
-    d_params = sum(p.numel() for p in discriminator.parameters())
-    print(f"📊 Generator: {g_params:,} parameters")
-    print(f"📊 Discriminator: {d_params:,} parameters")
+    # 6. Tester la prédiction
+    print("\n🎯 Test de prédiction...")
+    input_frames, target_frame = dataset[0]
+    predicted_frame = predict_next_frame(model, input_frames, device=DEVICE)
     
-    # Trainer
-    trainer = HighQualityTrainer(generator, discriminator, config)
+    # 7. Visualiser
+    print("\n📊 Visualisation des résultats...")
+    visualize_prediction(input_frames, target_frame, predicted_frame)
     
-    # Train
-    trainer.train(dataloader)
+    # 8. Plot de la courbe d'apprentissage
+    plt.figure(figsize=(10, 5))
+    plt.plot(history['train_loss'])
+    plt.title("Courbe d'apprentissage")
+    plt.xlabel("Epoch")
+    plt.ylabel("Loss (MSE)")
+    plt.grid(True)
+    plt.savefig("training_curve.png", dpi=150, bbox_inches='tight')
+    plt.show()
     
-    print("\n✅ Training complete!")
+    print("\n✅ Entraînement terminé!")
+    print(f"   Modèle sauvegardé: video_gpt_model.pth")
+    print(f"   Résultats sauvegardés: prediction_result.png, training_curve.png")
 
 if __name__ == "__main__":
     main()

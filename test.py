@@ -156,7 +156,7 @@ if __name__ == '__main__':
     IMAGE_WIDTH = 128
     
     # 1. Dossier contenant TOUTES vos frames originales
-    SOURCE_DATA_PATH = 'anime_frames_original'
+    SOURCE_DATA_PATH = '/kaggle/input/anima-s-dataset/test'
     
     # 2. Dossier qui contiendra les frames "propres" après filtrage
     CLEANED_DATA_PATH = 'anime_frames_cleaned'

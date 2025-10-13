@@ -1,27 +1,27 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torch.optim as optim
 from torch.utils.data import DataLoader, Dataset
-from torchvision import transforms, models
+from torchvision import transforms
 from PIL import Image
 from pathlib import Path
 import argparse
 import matplotlib.pyplot as plt
+from math import exp
 
-# --- 1. Dataset (Peu de changements) ---
+# --- 1. Dataset (Simplifié et Robuste) ---
 class AnimeFrameSequenceDataset(Dataset):
-    """Dataset pour charger les séquences de frames (T-1, T) -> (T+1)."""
     def __init__(self, data_dir: str, image_size: int = 256):
         self.image_size = image_size
         self.files = sorted([p for p in Path(data_dir).glob('*.png')])
         if len(self.files) < 3:
             raise ValueError("Le dossier doit contenir au moins 3 frames.")
         
+        # Une simple transformation vers un tenseur [0, 1] est plus stable.
         self.transform = transforms.Compose([
             transforms.Resize((image_size, image_size)),
             transforms.ToTensor(),
-            # Normalisation pour correspondre à ce que le modèle VGG attend
-            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
         ])
 
     def __len__(self) -> int:
@@ -41,9 +41,9 @@ class AnimeFrameSequenceDataset(Dataset):
         input_tensor = torch.cat([tensor1, tensor2], dim=0)
         return input_tensor, target
 
-# --- 2. Architecture du Modèle (Votre U-Net amélioré) ---
-class GeneratorUNet(nn.Module):
-    """Architecture U-Net utilisée comme générateur."""
+# --- 2. Architecture U-Net (Votre code original avec l'activation corrigée) ---
+class UNet(nn.Module):
+    """Architecture U-Net simplifiée, comme votre original."""
     def __init__(self, in_channels: int = 6, out_channels: int = 3):
         super().__init__()
         self.enc1 = self.conv_block(in_channels, 64)
@@ -61,12 +61,10 @@ class GeneratorUNet(nn.Module):
 
     def conv_block(self, in_c: int, out_c: int) -> nn.Sequential:
         return nn.Sequential(
-            nn.Conv2d(in_c, out_c, kernel_size=3, padding=1, bias=False),
-            nn.BatchNorm2d(out_c),
-            nn.LeakyReLU(0.2, inplace=True),
-            nn.Conv2d(out_c, out_c, kernel_size=3, padding=1, bias=False),
-            nn.BatchNorm2d(out_c),
-            nn.LeakyReLU(0.2, inplace=True),
+            nn.Conv2d(in_c, out_c, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(out_c, out_c, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -84,85 +82,121 @@ class GeneratorUNet(nn.Module):
         d1 = torch.cat([d1, e1], dim=1)
         d1 = self.dec1(d1)
         out = self.final_conv(d1)
-        return out
+        # **LA CORRECTION CRUCIALE** : La fonction Sigmoid assure que la sortie est une image valide (valeurs entre 0 et 1)
+        return torch.sigmoid(out)
 
-# --- 3. NOUVEAU : Perte Perceptuelle (VGG Loss) ---
-class PerceptualLoss(nn.Module):
-    """Calcule la perte basée sur les caractéristiques extraites d'un VGG pré-entraîné."""
-    def __init__(self, device):
-        super().__init__()
-        vgg = models.vgg16(weights=models.VGG16_Weights.IMAGENET1K_V1).features[:23].to(device).eval()
-        for param in vgg.parameters():
-            param.requires_grad = False
-        self.vgg = vgg
-        self.loss_fn = nn.L1Loss()
-        # Normalisation pour les images entrant dans VGG
-        self.register_buffer("mean", torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1).to(device))
-        self.register_buffer("std", torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1).to(device))
+# --- 3. NOUVEAU : Fonction de Perte SSIM pour la qualité d'image ---
+# (Intégrée directement pour ne pas nécessiter de librairie externe)
+def gaussian(window_size, sigma):
+    gauss = torch.Tensor([exp(-(x - window_size//2)**2/float(2*sigma**2)) for x in range(window_size)])
+    return gauss/gauss.sum()
 
-    def forward(self, input_img: torch.Tensor, target_img: torch.Tensor) -> torch.Tensor:
-        # Les entrées du dataset sont déjà normalisées, pas besoin de le refaire ici.
-        input_features = self.vgg(input_img)
-        target_features = self.vgg(target_img)
-        return self.loss_fn(input_features, target_features)
+def create_window(window_size, channel=1):
+    _1D_window = gaussian(window_size, 1.5).unsqueeze(1)
+    _2D_window = _1D_window.mm(_1D_window.t()).float().unsqueeze(0).unsqueeze(0)
+    window = _2D_window.expand(channel, 1, window_size, window_size).contiguous()
+    return window
+
+def ssim(img1, img2, window_size=11, window=None, size_average=True, full=False, val_range=None):
+    if val_range is None:
+        if torch.max(img1) > 128: max_val = 255
+        else: max_val = 1
+        if torch.min(img1) < -0.5: min_val = -1
+        else: min_val = 0
+        L = max_val - min_val
+    else: L = val_range
+
+    padd = 0
+    (_, channel, height, width) = img1.size()
+    if window is None:
+        real_size = min(window_size, height, width)
+        window = create_window(real_size, channel=channel).to(img1.device)
+
+    mu1 = F.conv2d(img1, window, padding=padd, groups=channel)
+    mu2 = F.conv2d(img2, window, padding=padd, groups=channel)
+
+    mu1_sq = mu1.pow(2); mu2_sq = mu2.pow(2); mu1_mu2 = mu1 * mu2
+    sigma1_sq = F.conv2d(img1 * img1, window, padding=padd, groups=channel) - mu1_sq
+    sigma2_sq = F.conv2d(img2 * img2, window, padding=padd, groups=channel) - mu2_sq
+    sigma12 = F.conv2d(img1 * img2, window, padding=padd, groups=channel) - mu1_mu2
+
+    C1 = (0.01 * L) ** 2; C2 = (0.03 * L) ** 2
+    v1 = 2.0 * sigma12 + C2; v2 = sigma1_sq + sigma2_sq + C2
+    ssim_map = ((2 * mu1_mu2 + C1) * v1) / ((mu1_sq + mu2_sq + C1) * v2)
+
+    if size_average: ret = ssim_map.mean()
+    else: ret = ssim_map.mean(1).mean(1).mean(1)
+    
+    if full: return ret, v1/v2
+    return ret
+
+class SSIMLoss(torch.nn.Module):
+    def __init__(self, window_size=11, size_average=True, val_range=None):
+        super(SSIMLoss, self).__init__()
+        self.window_size = window_size
+        self.size_average = size_average
+        self.val_range = val_range
+        self.channel = 1
+        self.window = create_window(window_size)
+
+    def forward(self, img1, img2):
+        (_, channel, _, _) = img1.size()
+        if channel == self.channel and self.window.data.type() == img1.data.type():
+            window = self.window
+        else:
+            window = create_window(self.window_size, channel).to(img1.device).type(img1.type())
+            self.window = window
+            self.channel = channel
+        return 1.0 - ssim(img1, img2, window=window, size_average=self.size_average)
 
 # --- 4. Fonctions d'Entraînement et de Génération ---
 
 def train(args: argparse.Namespace, device):
-    """Fonction principale pour l'entraînement."""
     dataset = AnimeFrameSequenceDataset(args.data_dir, image_size=args.image_size)
     loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True, num_workers=4)
+    model = UNet(in_channels=6, out_channels=3).to(device)
     
-    model = GeneratorUNet(in_channels=6, out_channels=3).to(device)
-    
-    # Deux types de perte : L1 pour la structure globale, Perceptuelle pour les détails
     criterion_l1 = nn.L1Loss()
-    criterion_perceptual = PerceptualLoss(device)
-    lambda_l1 = 1.0  # Poids pour la perte L1
-    lambda_perceptual = 0.2 # Poids pour la perte perceptuelle
-
+    criterion_ssim = SSIMLoss().to(device)
+    
+    # On combine les deux pertes. Alpha contrôle l'équilibre (0.85 est un bon début).
+    alpha = 0.85
     optimizer = optim.Adam(model.parameters(), lr=args.lr)
 
-    print("Début de l'entraînement avec Perte Perceptuelle...")
+    print("Début de l'entraînement avec Perte L1 + SSIM...")
     for epoch in range(args.epochs):
         model.train()
         total_loss = 0.0
         for inputs, targets in loader:
             inputs, targets = inputs.to(device), targets.to(device)
-            
             optimizer.zero_grad()
             preds = model(inputs)
             
-            # Calcul des deux pertes
             loss_l1 = criterion_l1(preds, targets)
-            loss_perceptual = criterion_perceptual(preds, targets)
-            
-            # Perte combinée
-            loss = lambda_l1 * loss_l1 + lambda_perceptual * loss_perceptual
+            loss_ssim = criterion_ssim(preds, targets)
+            loss = alpha * loss_ssim + (1 - alpha) * loss_l1
             
             loss.backward()
             optimizer.step()
             total_loss += loss.item()
 
         avg_loss = total_loss / len(loader)
-        print(f"Epoch {epoch+1}/{args.epochs} - Perte Combinée : {avg_loss:.6f}")
+        print(f"Epoch {epoch+1}/{args.epochs} - Perte Combinée: {avg_loss:.6f}")
 
         if (epoch + 1) % args.save_every == 0:
             save_prediction_examples(model, loader, device, epoch + 1, args.out_dir)
-            model_path = Path(args.checkpoint_dir) / f"unet_perceptual_epoch_{epoch+1}.pth"
+            model_path = Path(args.checkpoint_dir) / f"unet_ssim_epoch_{epoch+1}.pth"
             model_path.parent.mkdir(exist_ok=True, parents=True)
             torch.save(model.state_dict(), str(model_path))
             print(f"Modèle et exemples sauvegardés pour l'époque {epoch+1}")
-            
     print("Entraînement terminé.")
 
 def generate_sequence(args: argparse.Namespace, device):
-    """Fonction pour générer une séquence à partir d'un modèle entraîné."""
-    model = GeneratorUNet().to(device)
+    model = UNet().to(device)
     try:
         model.load_state_dict(torch.load(args.model_path, map_location=device))
     except FileNotFoundError:
-        print(f"Erreur: Fichier modèle non trouvé à l'adresse '{args.model_path}'")
+        print(f"Erreur: Fichier modèle '{args.model_path}' non trouvé.")
         return
     model.eval()
     print("Modèle chargé.")
@@ -170,9 +204,8 @@ def generate_sequence(args: argparse.Namespace, device):
     transform = transforms.Compose([
         transforms.Resize((args.image_size, args.image_size)),
         transforms.ToTensor(),
-        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
     ])
-
+    
     try:
         img1 = Image.open(args.start_frame_1).convert("RGB")
         img2_path = args.start_frame_2 if args.start_frame_2 else args.start_frame_1
@@ -183,7 +216,6 @@ def generate_sequence(args: argparse.Namespace, device):
 
     tensor1 = transform(img1).to(device)
     tensor2 = transform(img2).to(device)
-
     output_dir = Path(args.output_dir)
     output_dir.mkdir(exist_ok=True, parents=True)
     img1.save(output_dir / "frame_000.png")
@@ -195,49 +227,30 @@ def generate_sequence(args: argparse.Namespace, device):
             input_tensor = torch.cat([tensor1, tensor2], dim=0).unsqueeze(0)
             predicted_tensor = model(input_tensor).squeeze(0)
             
-            save_tensor_as_image(predicted_tensor.cpu(), output_dir / f"frame_{i+2:03d}.png")
+            predicted_img = transforms.ToPILImage()(predicted_tensor.cpu())
+            predicted_img.save(output_dir / f"frame_{i+2:03d}.png")
             print(f"Frame {i+2} générée.")
-
             tensor1, tensor2 = tensor2, predicted_tensor
-            
     print(f"Séquence sauvegardée dans '{output_dir}'.")
 
-def denormalize(tensor):
-    """Dénormalise un tenseur pour l'affichage."""
-    mean = torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1)
-    std = torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1)
-    return (tensor * std + mean).clamp(0, 1)
-
-def save_tensor_as_image(tensor, path):
-    """Sauvegarde un tenseur dénormalisé en tant qu'image."""
-    img_tensor = denormalize(tensor)
-    img = transforms.ToPILImage()(img_tensor)
-    img.save(path)
-
 def save_prediction_examples(model, loader, device, epoch, output_dir):
-    """Sauvegarde quelques exemples de prédictions pendant l'entraînement."""
     model.eval()
     inputs, _ = next(iter(loader))
     inputs = inputs.to(device)
-    
     with torch.no_grad():
         preds = model(inputs)
 
     fig, axes = plt.subplots(3, 3, figsize=(12, 12))
     fig.suptitle(f"Prédictions à l'Époque {epoch}", fontsize=16)
-
     for i in range(min(3, inputs.size(0))):
-        input_frame_1 = denormalize(inputs[i][:3].cpu())
-        input_frame_2 = denormalize(inputs[i][3:].cpu())
-        predicted_frame = denormalize(preds[i].cpu())
-        
-        axes[i, 0].imshow(input_frame_1.permute(1, 2, 0))
-        axes[i, 0].set_title(f"Frame T-1")
-        axes[i, 1].imshow(input_frame_2.permute(1, 2, 0))
-        axes[i, 1].set_title(f"Frame T")
-        axes[i, 2].imshow(predicted_frame.permute(1, 2, 0))
-        axes[i, 2].set_title("Prédiction T+1")
-        for ax in axes[i]: ax.axis("off")
+        for img_tensor, ax, title in [
+            (inputs[i][:3], axes[i,0], "Frame T-1"),
+            (inputs[i][3:], axes[i,1], "Frame T"),
+            (preds[i],      axes[i,2], "Prédiction T+1")
+        ]:
+            ax.imshow(img_tensor.cpu().permute(1, 2, 0))
+            ax.set_title(title)
+            ax.axis("off")
             
     plt.tight_layout(rect=[0, 0.03, 1, 0.95])
     Path(output_dir).mkdir(exist_ok=True, parents=True)
@@ -247,38 +260,30 @@ def save_prediction_examples(model, loader, device, epoch, output_dir):
 
 # --- 5. Point d'Entrée Principal ---
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Entraîner ou générer des séquences de frames avec un U-Net et une perte perceptuelle.")
-    parser.add_argument("--mode", type=str, required=True, choices=["train", "generate"], help="Choisir le mode : 'train' ou 'generate'.")
-    
-    # Arguments pour l'entraînement
+    parser = argparse.ArgumentParser(description="Entraîner ou générer des séquences de frames avec un U-Net amélioré.")
+    parser.add_argument("--mode", type=str, required=True, choices=["train", "generate"], help="Mode: 'train' ou 'generate'.")
     train_args = parser.add_argument_group('Arguments pour l\'entraînement')
-    train_args.add_argument("--data_dir", type=str, help="Chemin du dossier contenant les frames pour l'entraînement.")
-    train_args.add_argument("--epochs", type=int, default=150, help="Nombre d'époques.")
+    train_args.add_argument("--data_dir", type=str, help="Dossier des frames pour l'entraînement.")
+    train_args.add_argument("--epochs", type=int, default=100, help="Nombre d'époques.")
     train_args.add_argument("--batch_size", type=int, default=4, help="Taille du batch.")
     train_args.add_argument("--lr", type=float, default=1e-4, help="Taux d'apprentissage.")
-    train_args.add_argument("--save_every", type=int, default=10, help="Fréquence de sauvegarde des exemples (en époques).")
-
-    # Arguments pour la génération
+    train_args.add_argument("--save_every", type=int, default=10, help="Fréquence de sauvegarde des exemples.")
     gen_args = parser.add_argument_group('Arguments pour la génération')
     gen_args.add_argument("--model_path", type=str, help="Chemin vers le modèle (.pth) pour la génération.")
-    gen_args.add_argument("--start_frame_1", type=str, help="Chemin vers la première image de la séquence.")
-    gen_args.add_argument("--start_frame_2", type=str, help="(Optionnel) Chemin vers la deuxième image.")
+    gen_args.add_argument("--start_frame_1", type=str, help="Première image de la séquence.")
+    gen_args.add_argument("--start_frame_2", type=str, help="(Optionnel) Deuxième image.")
     gen_args.add_argument("--num_frames", type=int, default=10, help="Nombre de frames à générer.")
-
-    # Arguments communs
     parser.add_argument("--image_size", type=int, default=256, help="Taille des images.")
-    parser.add_argument("--out_dir", type=str, default="outputs_perceptual", help="Dossier de sortie pour les images/exemples.")
-    parser.add_argument("--checkpoint_dir", type=str, default="checkpoints_perceptual", help="Dossier de sortie pour les modèles.")
+    parser.add_argument("--out_dir", type=str, default="outputs_ssim", help="Dossier de sortie pour images/exemples.")
+    parser.add_argument("--checkpoint_dir", type=str, default="checkpoints_ssim", help="Dossier pour sauvegarder les modèles.")
     
     args = parser.parse_args()
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Utilisation du device : {device}")
 
     if args.mode == "train":
-        if not args.data_dir:
-            parser.error("--data_dir est requis pour le mode 'train'.")
+        if not args.data_dir: parser.error("--data_dir est requis pour le mode 'train'.")
         train(args, device)
     elif args.mode == "generate":
-        if not args.model_path or not args.start_frame_1:
-            parser.error("--model_path et --start_frame_1 sont requis pour le mode 'generate'.")
+        if not args.model_path or not args.start_frame_1: parser.error("--model_path et --start_frame_1 sont requis pour le mode 'generate'.")
         generate_sequence(args, device)

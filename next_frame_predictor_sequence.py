@@ -1,15 +1,14 @@
-import os
-from pathlib import Path
-import argparse
 import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader, Dataset
+from torchvision import transforms, models
 from PIL import Image
-from torchvision import transforms
+from pathlib import Path
+import argparse
 import matplotlib.pyplot as plt
 
-# --- 1. Chargement des Données (Identique à votre code) ---
+# --- 1. Dataset (Peu de changements) ---
 class AnimeFrameSequenceDataset(Dataset):
     """Dataset pour charger les séquences de frames (T-1, T) -> (T+1)."""
     def __init__(self, data_dir: str, image_size: int = 256):
@@ -21,17 +20,15 @@ class AnimeFrameSequenceDataset(Dataset):
         self.transform = transforms.Compose([
             transforms.Resize((image_size, image_size)),
             transforms.ToTensor(),
-            # Normalisation importante pour les GANs pour stabiliser l'entraînement
-            transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]),
+            # Normalisation pour correspondre à ce que le modèle VGG attend
+            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
         ])
 
     def __len__(self) -> int:
         return len(self.files) - 2
 
     def __getitem__(self, idx: int) -> tuple[torch.Tensor, torch.Tensor]:
-        img_path1 = self.files[idx]
-        img_path2 = self.files[idx + 1]
-        img_path3 = self.files[idx + 2]
+        img_path1, img_path2, img_path3 = self.files[idx], self.files[idx+1], self.files[idx+2]
         
         image1 = Image.open(img_path1).convert("RGB")
         image2 = Image.open(img_path2).convert("RGB")
@@ -42,15 +39,13 @@ class AnimeFrameSequenceDataset(Dataset):
         target = self.transform(target_image)
         
         input_tensor = torch.cat([tensor1, tensor2], dim=0)
-        
         return input_tensor, target
 
-# --- 2. Architecture du Générateur (Votre U-Net) ---
+# --- 2. Architecture du Modèle (Votre U-Net amélioré) ---
 class GeneratorUNet(nn.Module):
-    """Votre architecture U-Net, maintenant utilisée comme générateur."""
+    """Architecture U-Net utilisée comme générateur."""
     def __init__(self, in_channels: int = 6, out_channels: int = 3):
         super().__init__()
-        # Le code de votre U-Net est bon, on le garde tel quel.
         self.enc1 = self.conv_block(in_channels, 64)
         self.enc2 = self.conv_block(64, 128)
         self.enc3 = self.conv_block(128, 256)
@@ -89,156 +84,201 @@ class GeneratorUNet(nn.Module):
         d1 = torch.cat([d1, e1], dim=1)
         d1 = self.dec1(d1)
         out = self.final_conv(d1)
-        # Tanh est souvent utilisée comme fonction d'activation finale dans les GANs
-        return torch.tanh(out)
+        return out
 
-# --- 3. NOUVEAU : Architecture du Discriminateur ---
-class Discriminator(nn.Module):
-    """Discriminateur PatchGAN. Il détermine si chaque "patch" de l'image est réel ou faux."""
-    def __init__(self, in_channels: int = 3): # Il regarde une seule image (3 canaux)
+# --- 3. NOUVEAU : Perte Perceptuelle (VGG Loss) ---
+class PerceptualLoss(nn.Module):
+    """Calcule la perte basée sur les caractéristiques extraites d'un VGG pré-entraîné."""
+    def __init__(self, device):
         super().__init__()
-        # L'entrée du discriminateur est la concaténation des frames d'entrée et de la frame de sortie (réelle ou générée)
-        # Donc in_channels = 6 (input) + 3 (output) = 9
-        
-        def discriminator_block(in_c, out_c, stride=2, normalize=True):
-            layers = [nn.Conv2d(in_c, out_c, kernel_size=4, stride=stride, padding=1, bias=False)]
-            if normalize:
-                layers.append(nn.BatchNorm2d(out_c))
-            layers.append(nn.LeakyReLU(0.2, inplace=True))
-            return layers
+        vgg = models.vgg16(weights=models.VGG16_Weights.IMAGENET1K_V1).features[:23].to(device).eval()
+        for param in vgg.parameters():
+            param.requires_grad = False
+        self.vgg = vgg
+        self.loss_fn = nn.L1Loss()
+        # Normalisation pour les images entrant dans VGG
+        self.register_buffer("mean", torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1).to(device))
+        self.register_buffer("std", torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1).to(device))
 
-        self.model = nn.Sequential(
-            *discriminator_block(in_channels + 6, 64, normalize=False), # Entrée: Input (6) + Output (3) = 9 canaux
-            *discriminator_block(64, 128),
-            *discriminator_block(128, 256),
-            *discriminator_block(256, 512, stride=1),
-            nn.Conv2d(512, 1, kernel_size=4, padding=1) # Couche finale pour produire une sortie 1 canal
-        )
+    def forward(self, input_img: torch.Tensor, target_img: torch.Tensor) -> torch.Tensor:
+        # Les entrées du dataset sont déjà normalisées, pas besoin de le refaire ici.
+        input_features = self.vgg(input_img)
+        target_features = self.vgg(target_img)
+        return self.loss_fn(input_features, target_features)
 
-    def forward(self, img_in: torch.Tensor, img_out: torch.Tensor) -> torch.Tensor:
-        # Concaténer l'image d'entrée et l'image de sortie (la "condition")
-        x = torch.cat([img_in, img_out], dim=1)
-        return self.model(x)
+# --- 4. Fonctions d'Entraînement et de Génération ---
 
-# --- 4. Boucle d'Entraînement Améliorée ---
-
-def train_gan(args: argparse.Namespace):
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    print(f"Utilisation du device : {device}")
-
-    # Initialisation des modèles
-    generator = GeneratorUNet().to(device)
-    discriminator = Discriminator().to(device)
-
-    # Fonctions de perte
-    criterion_gan = nn.BCEWithLogitsLoss() # Perte adversariale
-    criterion_pixel = nn.L1Loss() # Perte L1 pour la structure
-    lambda_pixel = 100 # Poids pour la perte L1, valeur commune
-
-    # Optimiseurs
-    optimizer_g = optim.Adam(generator.parameters(), lr=args.lr, betas=(0.5, 0.999))
-    optimizer_d = optim.Adam(discriminator.parameters(), lr=args.lr, betas=(0.5, 0.999))
-
-    # Données
+def train(args: argparse.Namespace, device):
+    """Fonction principale pour l'entraînement."""
     dataset = AnimeFrameSequenceDataset(args.data_dir, image_size=args.image_size)
     loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True, num_workers=4)
+    
+    model = GeneratorUNet(in_channels=6, out_channels=3).to(device)
+    
+    # Deux types de perte : L1 pour la structure globale, Perceptuelle pour les détails
+    criterion_l1 = nn.L1Loss()
+    criterion_perceptual = PerceptualLoss(device)
+    lambda_l1 = 1.0  # Poids pour la perte L1
+    lambda_perceptual = 0.2 # Poids pour la perte perceptuelle
 
-    print("Début de l'entraînement GAN...")
+    optimizer = optim.Adam(model.parameters(), lr=args.lr)
+
+    print("Début de l'entraînement avec Perte Perceptuelle...")
     for epoch in range(args.epochs):
-        for i, (inputs, targets) in enumerate(loader):
+        model.train()
+        total_loss = 0.0
+        for inputs, targets in loader:
             inputs, targets = inputs.to(device), targets.to(device)
+            
+            optimizer.zero_grad()
+            preds = model(inputs)
+            
+            # Calcul des deux pertes
+            loss_l1 = criterion_l1(preds, targets)
+            loss_perceptual = criterion_perceptual(preds, targets)
+            
+            # Perte combinée
+            loss = lambda_l1 * loss_l1 + lambda_perceptual * loss_perceptual
+            
+            loss.backward()
+            optimizer.step()
+            total_loss += loss.item()
 
-            # Labels pour le réel et le faux
-            real_label = torch.ones(inputs.size(0), 1, 30, 30, device=device) # La taille dépend de la sortie du Discriminateur
-            fake_label = torch.zeros(inputs.size(0), 1, 30, 30, device=device)
-            
-            # --- Entraînement du Générateur ---
-            optimizer_g.zero_grad()
-            
-            fake_outputs = generator(inputs)
-            pred_fake = discriminator(inputs, fake_outputs)
-            loss_g_gan = criterion_gan(pred_fake, real_label) # Le générateur veut que le discriminateur pense que ses images sont réelles
-            loss_g_pixel = criterion_pixel(fake_outputs, targets)
-            
-            # Perte totale du générateur
-            loss_g = loss_g_gan + lambda_pixel * loss_g_pixel
-            loss_g.backward()
-            optimizer_g.step()
+        avg_loss = total_loss / len(loader)
+        print(f"Epoch {epoch+1}/{args.epochs} - Perte Combinée : {avg_loss:.6f}")
 
-            # --- Entraînement du Discriminateur ---
-            optimizer_d.zero_grad()
-            
-            # Perte avec les images réelles
-            pred_real = discriminator(inputs, targets)
-            loss_d_real = criterion_gan(pred_real, real_label)
-            
-            # Perte avec les images fausses (générées)
-            pred_fake = discriminator(inputs, fake_outputs.detach())
-            loss_d_fake = criterion_gan(pred_fake, fake_label)
-            
-            # Perte totale du discriminateur
-            loss_d = (loss_d_real + loss_d_fake) * 0.5
-            loss_d.backward()
-            optimizer_d.step()
-            
-            if i % 100 == 0:
-                print(f"[Epoch {epoch+1}/{args.epochs}] [Batch {i}/{len(loader)}] "
-                      f"[D loss: {loss_d.item():.4f}] [G loss: {loss_g.item():.4f}]")
-
-        # Sauvegarde des modèles et des exemples
         if (epoch + 1) % args.save_every == 0:
-            save_gan_examples(generator, loader, device, epoch + 1, args.out_dir)
-            Path(args.checkpoint_dir).mkdir(exist_ok=True)
-            torch.save(generator.state_dict(), f"{args.checkpoint_dir}/generator_epoch_{epoch+1}.pth")
-            torch.save(discriminator.state_dict(), f"{args.checkpoint_dir}/discriminator_epoch_{epoch+1}.pth")
-            print(f"Modèles et exemples sauvegardés pour l'époque {epoch+1}")
+            save_prediction_examples(model, loader, device, epoch + 1, args.out_dir)
+            model_path = Path(args.checkpoint_dir) / f"unet_perceptual_epoch_{epoch+1}.pth"
+            model_path.parent.mkdir(exist_ok=True, parents=True)
+            torch.save(model.state_dict(), str(model_path))
+            print(f"Modèle et exemples sauvegardés pour l'époque {epoch+1}")
+            
+    print("Entraînement terminé.")
 
-def save_gan_examples(generator, loader, device, epoch, output_dir):
-    """Sauvegarde des exemples de prédictions du GAN."""
-    generator.eval()
-    inputs, targets = next(iter(loader))
-    inputs, targets = inputs.to(device), targets.to(device)
+def generate_sequence(args: argparse.Namespace, device):
+    """Fonction pour générer une séquence à partir d'un modèle entraîné."""
+    model = GeneratorUNet().to(device)
+    try:
+        model.load_state_dict(torch.load(args.model_path, map_location=device))
+    except FileNotFoundError:
+        print(f"Erreur: Fichier modèle non trouvé à l'adresse '{args.model_path}'")
+        return
+    model.eval()
+    print("Modèle chargé.")
 
+    transform = transforms.Compose([
+        transforms.Resize((args.image_size, args.image_size)),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+    ])
+
+    try:
+        img1 = Image.open(args.start_frame_1).convert("RGB")
+        img2_path = args.start_frame_2 if args.start_frame_2 else args.start_frame_1
+        img2 = Image.open(img2_path).convert("RGB")
+    except FileNotFoundError as e:
+        print(f"Erreur: Fichier image non trouvé - {e}")
+        return
+
+    tensor1 = transform(img1).to(device)
+    tensor2 = transform(img2).to(device)
+
+    output_dir = Path(args.output_dir)
+    output_dir.mkdir(exist_ok=True, parents=True)
+    img1.save(output_dir / "frame_000.png")
+    img2.save(output_dir / "frame_001.png")
+
+    print(f"Génération de {args.num_frames} frames...")
     with torch.no_grad():
-        fake_outputs = generator(inputs)
+        for i in range(args.num_frames):
+            input_tensor = torch.cat([tensor1, tensor2], dim=0).unsqueeze(0)
+            predicted_tensor = model(input_tensor).squeeze(0)
+            
+            save_tensor_as_image(predicted_tensor.cpu(), output_dir / f"frame_{i+2:03d}.png")
+            print(f"Frame {i+2} générée.")
 
-    # Dénormaliser les images pour l'affichage
-    def denorm(img_tensor):
-        return img_tensor * 0.5 + 0.5
+            tensor1, tensor2 = tensor2, predicted_tensor
+            
+    print(f"Séquence sauvegardée dans '{output_dir}'.")
+
+def denormalize(tensor):
+    """Dénormalise un tenseur pour l'affichage."""
+    mean = torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1)
+    std = torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1)
+    return (tensor * std + mean).clamp(0, 1)
+
+def save_tensor_as_image(tensor, path):
+    """Sauvegarde un tenseur dénormalisé en tant qu'image."""
+    img_tensor = denormalize(tensor)
+    img = transforms.ToPILImage()(img_tensor)
+    img.save(path)
+
+def save_prediction_examples(model, loader, device, epoch, output_dir):
+    """Sauvegarde quelques exemples de prédictions pendant l'entraînement."""
+    model.eval()
+    inputs, _ = next(iter(loader))
+    inputs = inputs.to(device)
+    
+    with torch.no_grad():
+        preds = model(inputs)
 
     fig, axes = plt.subplots(3, 3, figsize=(12, 12))
-    fig.suptitle(f"Prédictions GAN à l'Époque {epoch}", fontsize=16)
+    fig.suptitle(f"Prédictions à l'Époque {epoch}", fontsize=16)
 
     for i in range(min(3, inputs.size(0))):
-        input_frame_1 = denorm(inputs[i][:3].cpu()).permute(1, 2, 0)
-        input_frame_2 = denorm(inputs[i][3:].cpu()).permute(1, 2, 0)
-        predicted_frame = denorm(fake_outputs[i].cpu()).permute(1, 2, 0)
+        input_frame_1 = denormalize(inputs[i][:3].cpu())
+        input_frame_2 = denormalize(inputs[i][3:].cpu())
+        predicted_frame = denormalize(preds[i].cpu())
         
-        axes[i, 0].imshow(input_frame_1)
+        axes[i, 0].imshow(input_frame_1.permute(1, 2, 0))
         axes[i, 0].set_title(f"Frame T-1")
-        axes[i, 1].imshow(input_frame_2)
+        axes[i, 1].imshow(input_frame_2.permute(1, 2, 0))
         axes[i, 1].set_title(f"Frame T")
-        axes[i, 2].imshow(predicted_frame)
+        axes[i, 2].imshow(predicted_frame.permute(1, 2, 0))
         axes[i, 2].set_title("Prédiction T+1")
-
         for ax in axes[i]: ax.axis("off")
             
     plt.tight_layout(rect=[0, 0.03, 1, 0.95])
-    Path(output_dir).mkdir(exist_ok=True)
-    plt.savefig(f"{output_dir}/epoch_{epoch:04d}.png")
+    Path(output_dir).mkdir(exist_ok=True, parents=True)
+    plt.savefig(Path(output_dir) / f"epoch_{epoch:04d}.png")
     plt.close(fig)
-    generator.train()
+    model.train()
 
+# --- 5. Point d'Entrée Principal ---
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Entraîner un GAN pour la prédiction de séquences de frames.")
-    parser.add_argument("--data_dir", type=str, required=True, help="Chemin du dossier contenant les frames.")
+    parser = argparse.ArgumentParser(description="Entraîner ou générer des séquences de frames avec un U-Net et une perte perceptuelle.")
+    parser.add_argument("--mode", type=str, required=True, choices=["train", "generate"], help="Choisir le mode : 'train' ou 'generate'.")
+    
+    # Arguments pour l'entraînement
+    train_args = parser.add_argument_group('Arguments pour l\'entraînement')
+    train_args.add_argument("--data_dir", type=str, help="Chemin du dossier contenant les frames pour l'entraînement.")
+    train_args.add_argument("--epochs", type=int, default=150, help="Nombre d'époques.")
+    train_args.add_argument("--batch_size", type=int, default=4, help="Taille du batch.")
+    train_args.add_argument("--lr", type=float, default=1e-4, help="Taux d'apprentissage.")
+    train_args.add_argument("--save_every", type=int, default=10, help="Fréquence de sauvegarde des exemples (en époques).")
+
+    # Arguments pour la génération
+    gen_args = parser.add_argument_group('Arguments pour la génération')
+    gen_args.add_argument("--model_path", type=str, help="Chemin vers le modèle (.pth) pour la génération.")
+    gen_args.add_argument("--start_frame_1", type=str, help="Chemin vers la première image de la séquence.")
+    gen_args.add_argument("--start_frame_2", type=str, help="(Optionnel) Chemin vers la deuxième image.")
+    gen_args.add_argument("--num_frames", type=int, default=10, help="Nombre de frames à générer.")
+
+    # Arguments communs
     parser.add_argument("--image_size", type=int, default=256, help="Taille des images.")
-    parser.add_argument("--epochs", type=int, default=200, help="Nombre d'époques (les GANs nécessitent plus d'entraînement).")
-    parser.add_argument("--batch_size", type=int, default=1, help="Taille du batch (1 est commun pour les pix2pix).")
-    parser.add_argument("--lr", type=float, default=2e-4, help="Taux d'apprentissage.")
-    parser.add_argument("--save_every", type=int, default=10, help="Fréquence de sauvegarde.")
-    parser.add_argument("--out_dir", type=str, default="outputs_gan", help="Dossier pour sauvegarder les images d'exemples.")
-    parser.add_argument("--checkpoint_dir", type=str, default="checkpoints_gan", help="Dossier pour sauvegarder les modèles.")
+    parser.add_argument("--out_dir", type=str, default="outputs_perceptual", help="Dossier de sortie pour les images/exemples.")
+    parser.add_argument("--checkpoint_dir", type=str, default="checkpoints_perceptual", help="Dossier de sortie pour les modèles.")
     
     args = parser.parse_args()
-    train_gan(args)
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    print(f"Utilisation du device : {device}")
+
+    if args.mode == "train":
+        if not args.data_dir:
+            parser.error("--data_dir est requis pour le mode 'train'.")
+        train(args, device)
+    elif args.mode == "generate":
+        if not args.model_path or not args.start_frame_1:
+            parser.error("--model_path et --start_frame_1 sont requis pour le mode 'generate'.")
+        generate_sequence(args, device)

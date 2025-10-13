@@ -62,6 +62,25 @@ def default_transforms(image_size: int, is_train: bool) -> Callable[[Image.Image
         )
 
 
+def apply_pair_transforms(img_a: Image.Image, img_b: Image.Image, image_size: int, is_train: bool) -> Tuple[torch.Tensor, torch.Tensor]:
+    # Apply the same random choices to both images to preserve temporal alignment
+    resize_crop = T.Compose([
+        T.Resize(image_size, interpolation=T.InterpolationMode.BICUBIC, antialias=True),
+        T.CenterCrop(image_size),
+    ])
+    img_a = resize_crop(img_a)
+    img_b = resize_crop(img_b)
+    if is_train:
+        if random.random() < 0.5:
+            img_a = TF.hflip(img_a)
+            img_b = TF.hflip(img_b)
+    to_tensor = T.ToTensor()
+    norm = T.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5])
+    xa = norm(to_tensor(img_a))
+    xb = norm(to_tensor(img_b))
+    return xa, xb
+
+
 class FramePairDataset(Dataset):
     def __init__(
         self,
@@ -102,8 +121,7 @@ class FramePairDataset(Dataset):
         path_t, path_tp1 = self.pairs[index]
         img_t = Image.open(path_t).convert("RGB")
         img_tp1 = Image.open(path_tp1).convert("RGB")
-        x_t = self.transform(img_t)
-        x_tp1 = self.transform(img_tp1)
+        x_t, x_tp1 = apply_pair_transforms(img_t, img_tp1, self.image_size, self.is_train)
         return x_t, x_tp1
 
 
@@ -653,7 +671,13 @@ class UNetTranslator(nn.Module):
     def __init__(self, image_size: int = 128, base_channels: int = 64, bottleneck_channels: int = 512) -> None:
         super().__init__()
         c = base_channels
-        self.e1 = nn.Sequential(nn.Conv2d(3, c, 3, 1, 1), nn.ReLU(inplace=True), nn.Conv2d(c, c, 3, 1, 1), nn.ReLU(inplace=True))
+        self.in_block = nn.Sequential(
+            nn.Conv2d(6, c, 3, 1, 1),  # concatenate x_t and (optional) warped/aux; here x_t + residual placeholder
+            nn.ReLU(inplace=True),
+            nn.Conv2d(c, c, 3, 1, 1),
+            nn.ReLU(inplace=True),
+        )
+        self.e1 = nn.Identity()
         self.d1 = nn.Conv2d(c, c, 4, 2, 1)
         self.e2 = nn.Sequential(nn.Conv2d(c, c * 2, 3, 1, 1), nn.ReLU(inplace=True), nn.Conv2d(c * 2, c * 2, 3, 1, 1), nn.ReLU(inplace=True))
         self.d2 = nn.Conv2d(c * 2, c * 2, 4, 2, 1)
@@ -667,7 +691,7 @@ class UNetTranslator(nn.Module):
         self.out = nn.Sequential(nn.Conv2d(c * 2, c, 3, 1, 1), nn.ReLU(inplace=True), nn.Conv2d(c, 3, 3, 1, 1), nn.Tanh())
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        s1 = self.e1(x)
+        s1 = self.in_block(x)
         p1 = F.relu(self.d1(s1))
         s2 = self.e2(p1)
         p2 = F.relu(self.d2(s2))
@@ -1192,7 +1216,7 @@ def train_predictor_ae(
         ae_model.load_state_dict(ckpt["state_dict"])  # type: ignore[index]
         translator.init_from_unet_autoencoder(ae_model.state_dict())
 
-    opt = torch.optim.Adam(translator.parameters(), lr=lr)
+    opt = torch.optim.AdamW(translator.parameters(), lr=lr, betas=(0.9, 0.95), weight_decay=0.01)
     l1 = nn.L1Loss()
 
     translator.train()
@@ -1203,11 +1227,15 @@ def train_predictor_ae(
             x_t = x_t.to(device_t, non_blocking=True)
             x_tp1 = x_tp1.to(device_t, non_blocking=True)
             last_batch = (x_t, x_tp1)
-            y = translator(x_t)
+            # concatenate x_t with itself as simple 6-channel input (placeholder for auxiliary)
+            y = translator(torch.cat([x_t, x_t], dim=1))
             loss_rec = l1(y, x_tp1)
             loss_edge = sobel_edge_loss(y, x_tp1)
             loss_ssim = ssim_loss_simple(y, x_tp1)
-            loss = loss_rec + 0.1 * loss_edge + 0.5 * loss_ssim
+            # Encourage motion: penalize identical outputs to inputs inside random global mask
+            rand_mask = make_random_edit_mask(x_t.shape[2], x_t.shape[3]).to(device_t).unsqueeze(0).expand(x_t.shape[0], -1, -1, -1)
+            motion_penalty = F.l1_loss(y * rand_mask, x_t * rand_mask)
+            loss = loss_rec + 0.1 * loss_edge + 0.5 * loss_ssim + 0.1 * motion_penalty
             opt.zero_grad(set_to_none=True)
             loss.backward()
             torch.nn.utils.clip_grad_norm_(translator.parameters(), 1.0)
@@ -1217,7 +1245,7 @@ def train_predictor_ae(
         if last_batch is not None:
             translator.eval()
             with torch.no_grad():
-                vis = translator(last_batch[0][:1])
+                vis = translator(torch.cat([last_batch[0][:1], last_batch[0][:1]], dim=1))
             save_image_grid(last_batch[0][:1], vis, Path("samples/predictor_ae"), f"epoch_{epoch:03d}.png")
             translator.train()
 
@@ -1250,7 +1278,7 @@ def predict_next_ae(
         T.Normalize([0.5, 0.5, 0.5], [0.5, 0.5, 0.5]),
     ])
     x = tfm(img).unsqueeze(0).to(device_t)
-    y = translator(x)
+    y = translator(torch.cat([x, x], dim=1))
     out_path_p = Path(out_path)
     out_path_p.parent.mkdir(parents=True, exist_ok=True)
     save_image_grid(x, y, out_path_p.parent, out_path_p.name)
@@ -1283,7 +1311,7 @@ def eval_next_ae(
         x_t = x_t.to(device_t)
         x_tp1 = x_tp1.to(device_t)
         with torch.no_grad():
-            y = translator(x_t)
+            y = translator(torch.cat([x_t, x_t], dim=1))
         for i in range(x_t.shape[0]):
             psnr_vals.append(float(psnr_value(y[i:i+1], x_tp1[i:i+1]).item()))
             ssim_vals.append(float(ssim_value(y[i:i+1], x_tp1[i:i+1]).item()))

@@ -179,11 +179,23 @@ class ImprovedStrokePredictor(nn.Module):
         super(ImprovedStrokePredictor, self).__init__()
         
         # Utiliser un ResNet pré-entraîné comme encodeur
-        resnet = models.resnet34(pretrained=True)
-        self.feature_extractor = nn.Sequential(*list(resnet.children())[:-2])
+        resnet = models.resnet34(weights='DEFAULT')
         
-        # Adapter pour 6 canaux d'entrée
-        self.input_conv = nn.Conv2d(6, 64, kernel_size=7, stride=2, padding=3, bias=False)
+        # Remplacer la première couche pour accepter 6 canaux (canvas + target)
+        self.conv1 = nn.Conv2d(6, 64, kernel_size=7, stride=2, padding=3, bias=False)
+        # Copier les poids de la couche originale pour les 3 premiers canaux
+        with torch.no_grad():
+            self.conv1.weight[:, :3, :, :] = resnet.conv1.weight
+            self.conv1.weight[:, 3:, :, :] = resnet.conv1.weight  # Dupliquer pour les 3 autres canaux
+        
+        # Utiliser le reste du ResNet
+        self.bn1 = resnet.bn1
+        self.relu = resnet.relu
+        self.maxpool = resnet.maxpool
+        self.layer1 = resnet.layer1
+        self.layer2 = resnet.layer2
+        self.layer3 = resnet.layer3
+        self.layer4 = resnet.layer4
         
         # Mécanisme d'attention
         self.attention = nn.MultiheadAttention(512, num_heads=8, batch_first=True)
@@ -257,12 +269,19 @@ class ImprovedStrokePredictor(nn.Module):
         # Concaténer canvas et cible
         x = torch.cat([canvas, target], dim=1)
         
-        # Extraction de features
-        x = self.input_conv(x)
-        features = self.feature_extractor(x)
+        # Passer par le ResNet modifié
+        x = self.conv1(x)
+        x = self.bn1(x)
+        x = self.relu(x)
+        x = self.maxpool(x)
+        
+        x = self.layer1(x)
+        x = self.layer2(x)
+        x = self.layer3(x)
+        x = self.layer4(x)
         
         # Contexte global
-        context = self.context_encoder(features)
+        context = self.context_encoder(x)
         context = context.unsqueeze(1)
         
         # LSTM
@@ -358,7 +377,7 @@ class ImprovedDrawingAgent:
     def compute_perceptual_loss(self, drawn, target):
         """Calcule une loss perceptuelle avec VGG"""
         # Utiliser VGG pour la loss perceptuelle
-        vgg = models.vgg16(pretrained=True).features[:16].to(self.device).eval()
+        vgg = models.vgg16(weights='DEFAULT').features[:16].to(self.device).eval()
         
         with torch.no_grad():
             drawn_features = vgg(drawn)

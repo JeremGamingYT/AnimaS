@@ -92,7 +92,7 @@ if __name__ == '__main__':
     IMAGE_WIDTH = 128
     
     # !! MODIFIEZ CECI pour pointer vers votre dossier de frames d'animé !!
-    DATA_PATH = 'anime_frames' 
+    DATA_PATH = '/kaggle/input/anima-s-dataset/test' 
     
     # Création des dossiers pour les résultats
     RESULTS_PATH = 'results'

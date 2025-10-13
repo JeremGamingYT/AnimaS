@@ -131,7 +131,7 @@ transform = transforms.Compose([
 ])
 
 # Création du jeu de données et du chargeur de données
-dataset = FrameDataset(frame_dir='dummy_frames', transform=transform)
+dataset = FrameDataset(frame_dir='/kaggle/input/anima-s-dataset/test', transform=transform)
 loader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True)
 
 # Initialisation du modèle, de la fonction de perte et de l'optimiseur

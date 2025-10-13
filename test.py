@@ -25,35 +25,35 @@ class Config:
     CHECKPOINT_DIR = "checkpoints"
     OUTPUT_DIR = "predictions"
     
-    # Hyperparamètres - Optimisés pour qualité
+    # Hyperparamètres - Optimisés pour 12GB VRAM
     SEQUENCE_LENGTH = 3
-    IMG_SIZE = (256, 256)  # On augmente pour plus de détails
-    PATCH_SIZE = (64, 64)  # Taille des patches pour l'entraînement progressif
+    IMG_SIZE = (128, 128)  # Réduit de 256 à 128
+    PATCH_SIZE = (32, 32)  # Réduit de 64 à 32
     BATCH_SIZE = 1
-    GRADIENT_ACCUMULATION_STEPS = 8
+    GRADIENT_ACCUMULATION_STEPS = 4  # Réduit de 8 à 4
     LEARNING_RATE_G = 0.0001
     LEARNING_RATE_D = 0.00005
-    LEARNING_RATE_R = 0.0001  # Pour le refinement network
+    LEARNING_RATE_R = 0.0001
     NUM_EPOCHS = 300
     DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     
-    # Architecture
-    HIDDEN_DIM = 256
+    # Architecture - Réduite
+    HIDDEN_DIM = 128  # Réduit de 256 à 128
     NUM_LAYERS = 2
     
-    # Loss weights - Ajustés pour la qualité
-    RECONSTRUCTION_WEIGHT = 50.0  # Nouveau : pour la reconstruction parfaite
+    # Loss weights
+    RECONSTRUCTION_WEIGHT = 50.0
     L1_WEIGHT = 100.0
-    PERCEPTUAL_WEIGHT = 20.0  # Augmenté pour plus de détails
-    TEXTURE_WEIGHT = 10.0  # Nouveau : pour les détails fins
-    EDGE_WEIGHT = 5.0  # Nouveau : pour les contours nets
+    PERCEPTUAL_WEIGHT = 10.0  # Réduit de 20 à 10
+    TEXTURE_WEIGHT = 5.0  # Réduit de 10 à 5
+    EDGE_WEIGHT = 5.0
     GAN_WEIGHT = 1.0
-    SSIM_WEIGHT = 10.0  # Nouveau : structural similarity
+    SSIM_WEIGHT = 10.0
     
     # Training
     USE_MIXED_PRECISION = True
     CLIP_GRAD_NORM = 1.0
-    USE_PROGRESSIVE_TRAINING = True  # Entraînement progressif pour la qualité
+    USE_PROGRESSIVE_TRAINING = True
 
 # ==================== Module de Super-Résolution ====================
 class ResidualBlock(nn.Module):
@@ -75,24 +75,24 @@ class ResidualBlock(nn.Module):
 
 class QualityRefinementModule(nn.Module):
     """Module pour raffiner la qualité des images générées"""
-    def __init__(self, in_channels=3, num_blocks=8):
+    def __init__(self, in_channels=3, num_blocks=4):  # Réduit de 8 à 4
         super().__init__()
         
         # Extraction de features multi-échelle
         self.initial = nn.Sequential(
-            nn.Conv2d(in_channels, 64, 9, padding=4),
+            nn.Conv2d(in_channels, 32, 9, padding=4),  # Réduit de 64 à 32
             nn.ReLU(inplace=True)
         )
         
         # Residual blocks pour capturer les détails
-        self.res_blocks = nn.Sequential(*[ResidualBlock(64) for _ in range(num_blocks)])
+        self.res_blocks = nn.Sequential(*[ResidualBlock(32) for _ in range(num_blocks)])
         
         # Reconstruction haute qualité
         self.reconstruction = nn.Sequential(
-            nn.Conv2d(64, 64, 3, padding=1),
-            nn.BatchNorm2d(64),
+            nn.Conv2d(32, 32, 3, padding=1),
+            nn.BatchNorm2d(32),
             nn.ReLU(inplace=True),
-            nn.Conv2d(64, in_channels, 9, padding=4),
+            nn.Conv2d(32, in_channels, 9, padding=4),
             nn.Tanh()
         )
     
@@ -109,124 +109,109 @@ class HighQualityGenerator(nn.Module):
         super().__init__()
         self.config = config
         
-        # ========== ENCODER (Partagé) ==========
+        # ========== ENCODER (Partagé) - Dimensions réduites ==========
         self.encoder = nn.ModuleList([
-            # Level 1: 256 -> 128
+            # Level 1: 128 -> 64
             nn.Sequential(
-                nn.Conv2d(3, 64, 4, 2, 1),
+                nn.Conv2d(3, 32, 4, 2, 1),  # Réduit de 64 à 32
+                nn.BatchNorm2d(32),
+                nn.LeakyReLU(0.2),
+            ),
+            # Level 2: 64 -> 32
+            nn.Sequential(
+                nn.Conv2d(32, 64, 4, 2, 1),  # Réduit de 128 à 64
                 nn.BatchNorm2d(64),
                 nn.LeakyReLU(0.2),
-                ResidualBlock(64),  # Détails haute fréquence
             ),
-            # Level 2: 128 -> 64
+            # Level 3: 32 -> 16
             nn.Sequential(
-                nn.Conv2d(64, 128, 4, 2, 1),
+                nn.Conv2d(64, 128, 4, 2, 1),  # Réduit de 256 à 128
                 nn.BatchNorm2d(128),
                 nn.LeakyReLU(0.2),
-                ResidualBlock(128),
             ),
-            # Level 3: 64 -> 32
+            # Level 4: 16 -> 8
             nn.Sequential(
-                nn.Conv2d(128, 256, 4, 2, 1),
+                nn.Conv2d(128, 256, 4, 2, 1),  # Réduit de 512 à 256
                 nn.BatchNorm2d(256),
                 nn.LeakyReLU(0.2),
-                ResidualBlock(256),
-            ),
-            # Level 4: 32 -> 16
-            nn.Sequential(
-                nn.Conv2d(256, 512, 4, 2, 1),
-                nn.BatchNorm2d(512),
-                nn.LeakyReLU(0.2),
-                ResidualBlock(512),
             )
         ])
         
-        # ========== TEMPORAL MODULE ==========
+        # ========== TEMPORAL MODULE - Réduit ==========
         self.temporal_module = nn.LSTM(
-            input_size=512 * 16 * 16,  # Flatten features
-            hidden_size=2048,
+            input_size=256 * 8 * 8,  # Adapté aux nouvelles dimensions
+            hidden_size=512,  # Réduit de 2048 à 512
             num_layers=2,
             batch_first=True
         )
         
-        # Projection layer pour adapter la sortie du LSTM aux dimensions nécessaires
-        self.temporal_projection = nn.Linear(2048, 512 * 16 * 16)
+        # Projection layer
+        self.temporal_projection = nn.Linear(512, 256 * 8 * 8)
         
         # ========== RECONSTRUCTION DECODER ==========
-        # Pour reconstruire parfaitement l'image d'entrée
         self.reconstruction_decoder = nn.ModuleList([
-            # Level 4: 16 -> 32
+            # Level 4: 8 -> 16
             nn.Sequential(
-                nn.ConvTranspose2d(512, 256, 4, 2, 1),
-                nn.BatchNorm2d(256),
-                nn.ReLU(),
-                ResidualBlock(256),
-            ),
-            # Level 3: 32 -> 64
-            nn.Sequential(
-                nn.ConvTranspose2d(256 + 256, 128, 4, 2, 1),  # +256 pour skip connection
+                nn.ConvTranspose2d(256, 128, 4, 2, 1),
                 nn.BatchNorm2d(128),
                 nn.ReLU(),
-                ResidualBlock(128),
             ),
-            # Level 2: 64 -> 128
+            # Level 3: 16 -> 32
             nn.Sequential(
-                nn.ConvTranspose2d(128 + 128, 64, 4, 2, 1),  # +128 pour skip
+                nn.ConvTranspose2d(128 + 128, 64, 4, 2, 1),
                 nn.BatchNorm2d(64),
                 nn.ReLU(),
-                ResidualBlock(64),
             ),
-            # Level 1: 128 -> 256
+            # Level 2: 32 -> 64
             nn.Sequential(
-                nn.ConvTranspose2d(64 + 64, 32, 4, 2, 1),  # +64 pour skip
+                nn.ConvTranspose2d(64 + 64, 32, 4, 2, 1),
                 nn.BatchNorm2d(32),
                 nn.ReLU(),
-                nn.Conv2d(32, 3, 3, 1, 1),
+            ),
+            # Level 1: 64 -> 128
+            nn.Sequential(
+                nn.ConvTranspose2d(32 + 32, 16, 4, 2, 1),
+                nn.BatchNorm2d(16),
+                nn.ReLU(),
+                nn.Conv2d(16, 3, 3, 1, 1),
                 nn.Tanh()
             )
         ])
         
         # ========== PREDICTION DECODER ==========
-        # Pour prédire la frame suivante
         self.prediction_decoder = nn.ModuleList([
-            # Même architecture que reconstruction_decoder
-            nn.Sequential(
-                nn.ConvTranspose2d(512, 256, 4, 2, 1),
-                nn.BatchNorm2d(256),
-                nn.ReLU(),
-                ResidualBlock(256),
-            ),
             nn.Sequential(
                 nn.ConvTranspose2d(256, 128, 4, 2, 1),
                 nn.BatchNorm2d(128),
                 nn.ReLU(),
-                ResidualBlock(128),
             ),
             nn.Sequential(
                 nn.ConvTranspose2d(128, 64, 4, 2, 1),
                 nn.BatchNorm2d(64),
                 nn.ReLU(),
-                ResidualBlock(64),
             ),
             nn.Sequential(
                 nn.ConvTranspose2d(64, 32, 4, 2, 1),
                 nn.BatchNorm2d(32),
                 nn.ReLU(),
-                nn.Conv2d(32, 3, 3, 1, 1),
+            ),
+            nn.Sequential(
+                nn.ConvTranspose2d(32, 16, 4, 2, 1),
+                nn.BatchNorm2d(16),
+                nn.ReLU(),
+                nn.Conv2d(16, 3, 3, 1, 1),
                 nn.Tanh()
             )
         ])
         
-        # ========== QUALITY REFINEMENT ==========
-        self.quality_refiner = QualityRefinementModule(in_channels=3, num_blocks=6)
+        # ========== QUALITY REFINEMENT - Simplifié ==========
+        self.quality_refiner = QualityRefinementModule(in_channels=3, num_blocks=4)  # Réduit de 6 à 4
         
-        # ========== DETAIL ENHANCEMENT ==========
+        # ========== DETAIL ENHANCEMENT - Simplifié ==========
         self.detail_enhancer = nn.Sequential(
-            nn.Conv2d(6, 32, 3, 1, 1),  # 6 channels: original + refined
+            nn.Conv2d(6, 16, 3, 1, 1),  # Réduit de 32 à 16
             nn.ReLU(),
-            ResidualBlock(32),
-            ResidualBlock(32),
-            nn.Conv2d(32, 3, 3, 1, 1),
+            nn.Conv2d(16, 3, 3, 1, 1),
             nn.Tanh()
         )
     
@@ -280,8 +265,8 @@ class HighQualityGenerator(nn.Module):
             encoded_features.append(features)
             all_skip_connections.append(skip_connections)
             
-            # Reconstruire la frame actuelle pour vérifier la qualité
-            if return_all:
+            # Reconstruire seulement si nécessaire pour économiser la mémoire
+            if return_all and t == seq_len - 1:  # Seulement la dernière
                 reconstruction = self.decode_reconstruction(features, skip_connections)
                 reconstruction = self.quality_refiner(reconstruction)
                 reconstructions.append(reconstruction)
@@ -294,23 +279,29 @@ class HighQualityGenerator(nn.Module):
             flattened_features.append(flattened)
         
         temporal_input = torch.stack(flattened_features, dim=1)
+        
+        # Clear unused tensors
+        del encoded_features
+        torch.cuda.empty_cache()
+        
         temporal_output, _ = self.temporal_module(temporal_input)
         
         # Prendre la dernière sortie temporelle et projeter
-        last_temporal = temporal_output[:, -1]  # Shape: [batch_size, 2048]
-        last_temporal = self.temporal_projection(last_temporal)  # Shape: [batch_size, 512*16*16]
-        last_temporal = last_temporal.view(batch_size, 512, 16, 16)
+        last_temporal = temporal_output[:, -1]
+        last_temporal = self.temporal_projection(last_temporal)
+        last_temporal = last_temporal.view(batch_size, 256, 8, 8)
+        
+        # Clear unused tensors
+        del temporal_output, temporal_input
+        torch.cuda.empty_cache()
         
         # ========== PHASE 3: PREDICTION ==========
-        # Prédire la frame suivante
         predicted_frame = self.decode_prediction(last_temporal)
         
         # ========== PHASE 4: QUALITY REFINEMENT ==========
-        # Raffiner la prédiction
         refined_prediction = self.quality_refiner(predicted_frame)
         
         # ========== PHASE 5: DETAIL ENHANCEMENT ==========
-        # Combiner avec la dernière frame pour améliorer les détails
         last_input_frame = x[:, -1]
         combined = torch.cat([refined_prediction, last_input_frame], dim=1)
         final_prediction = self.detail_enhancer(combined)

@@ -1526,9 +1526,16 @@ def train_unet_next(
             x_tp1 = x_tp1.to(device_t, non_blocking=True)
             last_batch = (x_tm1, x_t, x_tp1)
 
-            # Use two inputs to break identity: predict delta on (t-1, t)
-            r = model(torch.cat([x_tm1, x_t], dim=1))
-            y = torch.clamp(x_t + r, -1.0, 1.0)
+            # Randomly drop one input to prevent trivial copying and encourage motion cues
+            if random.random() < 0.25:
+                if random.random() < 0.5:
+                    x_tm1 = torch.zeros_like(x_tm1)
+                else:
+                    x_t = torch.zeros_like(x_t)
+
+            # Predict next frame directly (no residual shortcut)
+            y = model(torch.cat([x_tm1, x_t], dim=1))
+            y = torch.clamp(y, -1.0, 1.0)
 
             with torch.no_grad():
                 diff = (x_tp1 - x_t).abs().mean(dim=1, keepdim=True)
@@ -1538,9 +1545,16 @@ def train_unet_next(
             loss_rec = l1(y, x_tp1)
             loss_edge = sobel_edge_loss(y, x_tp1)
             loss_ssim = ssim_loss_simple(y, x_tp1)
+            # Emphasize dynamic correctness
             loss_dyn = F.l1_loss(y * dyn_mask, x_tp1 * dyn_mask)
-            loss_static_id = F.l1_loss(y * static_mask, x_t * static_mask)
-            loss = loss_rec + 0.1 * loss_edge + 0.5 * loss_ssim + 0.5 * loss_dyn + 0.1 * loss_static_id
+            # Encourage non-zero change on dynamic areas (anti-identity)
+            diff_pred = (y - x_t).abs()
+            change_penalty = torch.clamp(0.02 - diff_pred, min=0.0) * dyn_mask
+            loss_change = change_penalty.mean()
+            # Very small static identity regularizer
+            loss_static_id = 0.05 * F.l1_loss(y * static_mask, x_t * static_mask)
+            # Final loss
+            loss = loss_rec + 0.2 * loss_edge + 0.7 * loss_ssim + 1.5 * loss_dyn + 0.5 * loss_change + loss_static_id
 
             opt.zero_grad(set_to_none=True)
             loss.backward()

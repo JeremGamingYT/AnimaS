@@ -180,15 +180,20 @@ def save_sample(generator, dataloader, device, out_dir, num_samples=5):
     os.makedirs(out_dir, exist_ok=True)
     generator.eval()
     with torch.no_grad():
+        # Ensure all tensors used for concatenation are on the same device (CPU) before saving
         for i, (img, target) in enumerate(dataloader):
             if i >= num_samples:
                 break
+            # Move input image to the generator's device for inference
             img = img.to(device)
+            # Generate prediction and bring it back to CPU
             pred = generator(img).cpu()
-            # Denormalize from [-1,1] to [0,1]
-            img_np = (img + 1) / 2.0
+            # Bring the original input and target to CPU and denormalize from [-1,1] to [0,1]
+            img_cpu = img.cpu()
+            target_cpu = target.cpu()
+            img_np = (img_cpu + 1) / 2.0
             pred_np = (pred + 1) / 2.0
-            target_np = (target + 1) / 2.0
+            target_np = (target_cpu + 1) / 2.0
             # Convert to PIL images
             to_pil = transforms.ToPILImage()
             for b in range(img_np.size(0)):

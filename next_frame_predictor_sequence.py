@@ -1,6 +1,7 @@
 import os
 from pathlib import Path
 from typing import List, Tuple
+import argparse # Correction: Import the argparse module
 
 import torch
 import torch.nn as nn
@@ -195,7 +196,6 @@ if __name__ == "__main__":
     parser.add_argument("--lr", type=float, default=1e-4, help="Taux d'apprentissage.")
     parser.add_argument("--save_every", type=int, default=10, help="Fréquence de sauvegarde des exemples (en époques).")
     parser.add_argument("--out_dir", type=str, default="outputs_sequence", help="Dossier pour sauvegarder les images d'exemples.")
-    # LA LIGNE CORRIGÉE EST CI-DESSOUS
     parser.add_argument("--checkpoint_dir", type=str, default="checkpoints_sequence", help="Dossier pour sauvegarder les modèles.")
     
     args = parser.parse_args()

@@ -10,7 +10,7 @@ import argparse
 import matplotlib.pyplot as plt
 from math import exp
 
-# --- 1. Dataset (Simplifié et Robuste) ---
+# --- 1. Dataset (Votre code, inchangé) ---
 class AnimeFrameSequenceDataset(Dataset):
     def __init__(self, data_dir: str, image_size: int = 256):
         self.image_size = image_size
@@ -18,7 +18,6 @@ class AnimeFrameSequenceDataset(Dataset):
         if len(self.files) < 3:
             raise ValueError("Le dossier doit contenir au moins 3 frames.")
         
-        # Une simple transformation vers un tenseur [0, 1] est plus stable.
         self.transform = transforms.Compose([
             transforms.Resize((image_size, image_size)),
             transforms.ToTensor(),
@@ -41,9 +40,8 @@ class AnimeFrameSequenceDataset(Dataset):
         input_tensor = torch.cat([tensor1, tensor2], dim=0)
         return input_tensor, target
 
-# --- 2. Architecture U-Net (Votre code original avec l'activation corrigée) ---
+# --- 2. Architecture U-Net (Votre code, inchangé) ---
 class UNet(nn.Module):
-    """Architecture U-Net simplifiée, comme votre original."""
     def __init__(self, in_channels: int = 6, out_channels: int = 3):
         super().__init__()
         self.enc1 = self.conv_block(in_channels, 64)
@@ -82,11 +80,10 @@ class UNet(nn.Module):
         d1 = torch.cat([d1, e1], dim=1)
         d1 = self.dec1(d1)
         out = self.final_conv(d1)
-        # **LA CORRECTION CRUCIALE** : La fonction Sigmoid assure que la sortie est une image valide (valeurs entre 0 et 1)
         return torch.sigmoid(out)
 
-# --- 3. NOUVEAU : Fonction de Perte SSIM pour la qualité d'image ---
-# (Intégrée directement pour ne pas nécessiter de librairie externe)
+# --- 3. AMÉLIORATION : Fonction de Perte SSIM pour la Qualité d'Image ---
+# Cette section est le seul ajout majeur. Elle aide le modèle à créer des images nettes.
 def gaussian(window_size, sigma):
     gauss = torch.Tensor([exp(-(x - window_size//2)**2/float(2*sigma**2)) for x in range(window_size)])
     return gauss/gauss.sum()
@@ -97,57 +94,22 @@ def create_window(window_size, channel=1):
     window = _2D_window.expand(channel, 1, window_size, window_size).contiguous()
     return window
 
-def ssim(img1, img2, window_size=11, window=None, size_average=True, full=False, val_range=None):
-    if val_range is None:
-        if torch.max(img1) > 128: max_val = 255
-        else: max_val = 1
-        if torch.min(img1) < -0.5: min_val = -1
-        else: min_val = 0
-        L = max_val - min_val
-    else: L = val_range
+def ssim(img1, img2, window_size=11, size_average=True):
+    (_, channel, _, _) = img1.size()
+    window = create_window(window_size, channel).to(img1.device)
+    mu1 = F.conv2d(img1, window, padding=window_size//2, groups=channel)
+    mu2 = F.conv2d(img2, window, padding=window_size//2, groups=channel)
+    mu1_sq, mu2_sq, mu1_mu2 = mu1.pow(2), mu2.pow(2), mu1 * mu2
+    sigma1_sq = F.conv2d(img1*img1, window, padding=window_size//2, groups=channel) - mu1_sq
+    sigma2_sq = F.conv2d(img2*img2, window, padding=window_size//2, groups=channel) - mu2_sq
+    sigma12 = F.conv2d(img1*img2, window, padding=window_size//2, groups=channel) - mu1_mu2
+    C1, C2 = 0.01**2, 0.03**2
+    ssim_map = ((2*mu1_mu2 + C1)*(2*sigma12 + C2))/((mu1_sq + mu2_sq + C1)*(sigma1_sq + sigma2_sq + C2))
+    return ssim_map.mean() if size_average else ssim_map.mean(1).mean(1).mean(1)
 
-    padd = 0
-    (_, channel, height, width) = img1.size()
-    if window is None:
-        real_size = min(window_size, height, width)
-        window = create_window(real_size, channel=channel).to(img1.device)
-
-    mu1 = F.conv2d(img1, window, padding=padd, groups=channel)
-    mu2 = F.conv2d(img2, window, padding=padd, groups=channel)
-
-    mu1_sq = mu1.pow(2); mu2_sq = mu2.pow(2); mu1_mu2 = mu1 * mu2
-    sigma1_sq = F.conv2d(img1 * img1, window, padding=padd, groups=channel) - mu1_sq
-    sigma2_sq = F.conv2d(img2 * img2, window, padding=padd, groups=channel) - mu2_sq
-    sigma12 = F.conv2d(img1 * img2, window, padding=padd, groups=channel) - mu1_mu2
-
-    C1 = (0.01 * L) ** 2; C2 = (0.03 * L) ** 2
-    v1 = 2.0 * sigma12 + C2; v2 = sigma1_sq + sigma2_sq + C2
-    ssim_map = ((2 * mu1_mu2 + C1) * v1) / ((mu1_sq + mu2_sq + C1) * v2)
-
-    if size_average: ret = ssim_map.mean()
-    else: ret = ssim_map.mean(1).mean(1).mean(1)
-    
-    if full: return ret, v1/v2
-    return ret
-
-class SSIMLoss(torch.nn.Module):
-    def __init__(self, window_size=11, size_average=True, val_range=None):
-        super(SSIMLoss, self).__init__()
-        self.window_size = window_size
-        self.size_average = size_average
-        self.val_range = val_range
-        self.channel = 1
-        self.window = create_window(window_size)
-
+class SSIMLoss(nn.Module):
     def forward(self, img1, img2):
-        (_, channel, _, _) = img1.size()
-        if channel == self.channel and self.window.data.type() == img1.data.type():
-            window = self.window
-        else:
-            window = create_window(self.window_size, channel).to(img1.device).type(img1.type())
-            self.window = window
-            self.channel = channel
-        return 1.0 - ssim(img1, img2, window=window, size_average=self.size_average)
+        return 1.0 - ssim(img1, img2)
 
 # --- 4. Fonctions d'Entraînement et de Génération ---
 
@@ -156,39 +118,36 @@ def train(args: argparse.Namespace, device):
     loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True, num_workers=4)
     model = UNet(in_channels=6, out_channels=3).to(device)
     
+    # MODIFICATION : On utilise maintenant une combinaison de deux pertes
     criterion_l1 = nn.L1Loss()
     criterion_ssim = SSIMLoss().to(device)
+    alpha = 0.85 # Poids important pour la qualité visuelle (SSIM)
     
-    # On combine les deux pertes. Alpha contrôle l'équilibre (0.85 est un bon début).
-    alpha = 0.85
     optimizer = optim.Adam(model.parameters(), lr=args.lr)
 
-    print("Début de l'entraînement avec Perte L1 + SSIM...")
+    print("Début de l'entraînement avec Perte L1 + SSIM pour une meilleure qualité...")
     for epoch in range(args.epochs):
         model.train()
-        total_loss = 0.0
         for inputs, targets in loader:
             inputs, targets = inputs.to(device), targets.to(device)
             optimizer.zero_grad()
             preds = model(inputs)
             
+            # Calcul de la perte combinée pour des images plus nettes
             loss_l1 = criterion_l1(preds, targets)
             loss_ssim = criterion_ssim(preds, targets)
             loss = alpha * loss_ssim + (1 - alpha) * loss_l1
             
             loss.backward()
             optimizer.step()
-            total_loss += loss.item()
 
-        avg_loss = total_loss / len(loader)
-        print(f"Epoch {epoch+1}/{args.epochs} - Perte Combinée: {avg_loss:.6f}")
+        print(f"Epoch {epoch+1}/{args.epochs} - Perte: {loss.item():.6f}")
 
         if (epoch + 1) % args.save_every == 0:
             save_prediction_examples(model, loader, device, epoch + 1, args.out_dir)
-            model_path = Path(args.checkpoint_dir) / f"unet_ssim_epoch_{epoch+1}.pth"
+            model_path = Path(args.checkpoint_dir) / f"unet_final_epoch_{epoch+1}.pth"
             model_path.parent.mkdir(exist_ok=True, parents=True)
             torch.save(model.state_dict(), str(model_path))
-            print(f"Modèle et exemples sauvegardés pour l'époque {epoch+1}")
     print("Entraînement terminé.")
 
 def generate_sequence(args: argparse.Namespace, device):
@@ -201,10 +160,7 @@ def generate_sequence(args: argparse.Namespace, device):
     model.eval()
     print("Modèle chargé.")
 
-    transform = transforms.Compose([
-        transforms.Resize((args.image_size, args.image_size)),
-        transforms.ToTensor(),
-    ])
+    transform = transforms.Compose([transforms.Resize((args.image_size, args.image_size)), transforms.ToTensor()])
     
     try:
         img1 = Image.open(args.start_frame_1).convert("RGB")
@@ -214,8 +170,7 @@ def generate_sequence(args: argparse.Namespace, device):
         print(f"Erreur: Fichier image non trouvé - {e}")
         return
 
-    tensor1 = transform(img1).to(device)
-    tensor2 = transform(img2).to(device)
+    tensor1, tensor2 = transform(img1).to(device), transform(img2).to(device)
     output_dir = Path(args.output_dir)
     output_dir.mkdir(exist_ok=True, parents=True)
     img1.save(output_dir / "frame_000.png")
@@ -229,7 +184,7 @@ def generate_sequence(args: argparse.Namespace, device):
             
             predicted_img = transforms.ToPILImage()(predicted_tensor.cpu())
             predicted_img.save(output_dir / f"frame_{i+2:03d}.png")
-            print(f"Frame {i+2} générée.")
+            
             tensor1, tensor2 = tensor2, predicted_tensor
     print(f"Séquence sauvegardée dans '{output_dir}'.")
 
@@ -237,26 +192,16 @@ def save_prediction_examples(model, loader, device, epoch, output_dir):
     model.eval()
     inputs, _ = next(iter(loader))
     inputs = inputs.to(device)
-    with torch.no_grad():
-        preds = model(inputs)
-
+    with torch.no_grad(): preds = model(inputs)
     fig, axes = plt.subplots(3, 3, figsize=(12, 12))
     fig.suptitle(f"Prédictions à l'Époque {epoch}", fontsize=16)
     for i in range(min(3, inputs.size(0))):
-        for img_tensor, ax, title in [
-            (inputs[i][:3], axes[i,0], "Frame T-1"),
-            (inputs[i][3:], axes[i,1], "Frame T"),
-            (preds[i],      axes[i,2], "Prédiction T+1")
-        ]:
-            ax.imshow(img_tensor.cpu().permute(1, 2, 0))
-            ax.set_title(title)
-            ax.axis("off")
-            
+        for img_tensor, ax, title in [(inputs[i][:3], axes[i,0], "Frame T-1"), (inputs[i][3:], axes[i,1], "Frame T"), (preds[i], axes[i,2], "Prédiction T+1")]:
+            ax.imshow(img_tensor.cpu().permute(1, 2, 0)); ax.set_title(title); ax.axis("off")
     plt.tight_layout(rect=[0, 0.03, 1, 0.95])
     Path(output_dir).mkdir(exist_ok=True, parents=True)
     plt.savefig(Path(output_dir) / f"epoch_{epoch:04d}.png")
     plt.close(fig)
-    model.train()
 
 # --- 5. Point d'Entrée Principal ---
 if __name__ == "__main__":
@@ -274,12 +219,11 @@ if __name__ == "__main__":
     gen_args.add_argument("--start_frame_2", type=str, help="(Optionnel) Deuxième image.")
     gen_args.add_argument("--num_frames", type=int, default=10, help="Nombre de frames à générer.")
     parser.add_argument("--image_size", type=int, default=256, help="Taille des images.")
-    parser.add_argument("--out_dir", type=str, default="outputs_ssim", help="Dossier de sortie pour images/exemples.")
-    parser.add_argument("--checkpoint_dir", type=str, default="checkpoints_ssim", help="Dossier pour sauvegarder les modèles.")
+    parser.add_argument("--out_dir", type=str, default="outputs_final", help="Dossier de sortie.")
+    parser.add_argument("--checkpoint_dir", type=str, default="checkpoints_final", help="Dossier des modèles.")
     
     args = parser.parse_args()
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    print(f"Utilisation du device : {device}")
 
     if args.mode == "train":
         if not args.data_dir: parser.error("--data_dir est requis pour le mode 'train'.")

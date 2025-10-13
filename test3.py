@@ -351,7 +351,7 @@ def main():
     os.makedirs('examples', exist_ok=True)
     
     # Chemin vers votre dataset d'images d'animé
-    DATASET_PATH = "path/to/your/anime/dataset"  # Remplacez par votre chemin
+    DATASET_PATH = "/kaggle/input/anima-s-dataset/test"  # Remplacez par votre chemin
     
     # Entraîner l'IA
     print("Démarrage de l'entraînement de l'IA de dessin...")

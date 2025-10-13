@@ -1,7 +1,6 @@
 """
 AnimeGenesis-X: Architecture Révolutionnaire pour Génération d'Anime
-Développé par: AI Research Lab
-Version: 1.0 EXPERIMENTAL
+Version: 1.1 FIXED
 """
 
 import torch
@@ -27,11 +26,6 @@ class AnimeDataset(Dataset):
     """Dataset personnalisé pour charger tes images d'anime"""
     
     def __init__(self, root_dir, image_size=256, augment=True):
-        """
-        root_dir: Dossier contenant tes images d'anime
-        image_size: Taille de redimensionnement
-        augment: Appliquer des augmentations
-        """
         self.root_dir = root_dir
         self.image_size = image_size
         self.augment = augment
@@ -43,39 +37,52 @@ class AnimeDataset(Dataset):
         
         print(f"📁 Dataset chargé: {len(self.image_paths)} images trouvées")
         
-        # Transformations de base
-        self.base_transform = T.Compose([
+        if len(self.image_paths) == 0:
+            print("⚠️ ATTENTION: Aucune image trouvée!")
+            print(f"   Vérifie que le dossier '{root_dir}' contient des images")
+            # Créer des images factices pour test
+            print("🎨 Création d'images de test...")
+            self.create_dummy_images = True
+        else:
+            self.create_dummy_images = False
+        
+        # Transformations
+        self.transform = T.Compose([
             T.Resize((image_size, image_size)),
             T.ToTensor(),
             T.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5])
         ])
         
-        # Augmentations pour améliorer la génération
-        self.augment_transform = T.Compose([
-            T.RandomHorizontalFlip(p=0.5),
-            T.ColorJitter(brightness=0.1, contrast=0.1, saturation=0.1, hue=0.05),
-            T.RandomAffine(degrees=5, translate=(0.05, 0.05), scale=(0.95, 1.05)),
-        ])
-        
+        if augment:
+            self.augment_transform = T.Compose([
+                T.RandomHorizontalFlip(p=0.5),
+                T.ColorJitter(brightness=0.1, contrast=0.1, saturation=0.1, hue=0.05),
+            ])
+        else:
+            self.augment_transform = None
+    
     def __len__(self):
-        return len(self.image_paths)
+        return max(len(self.image_paths), 200)  # Au moins 200 pour les tests
     
     def __getitem__(self, idx):
-        img_path = self.image_paths[idx]
+        if self.create_dummy_images or len(self.image_paths) == 0:
+            # Créer une image factice colorée pour test
+            img_array = np.random.rand(self.image_size, self.image_size, 3) * 255
+            image = Image.fromarray(img_array.astype('uint8'), 'RGB')
+        else:
+            img_path = self.image_paths[idx % len(self.image_paths)]
+            image = Image.open(img_path).convert('RGB')
         
-        # Charger l'image
-        image = Image.open(img_path).convert('RGB')
-        
-        # Appliquer augmentations si activé
-        if self.augment and np.random.random() > 0.5:
+        # Augmentation
+        if self.augment_transform and self.augment and np.random.random() > 0.5:
             image = self.augment_transform(image)
         
-        # Transformation de base
-        image = self.base_transform(image)
+        # Transformation finale
+        image = self.transform(image)
         
         return image
 
-# ================== PARTIE 2: ARCHITECTURE RÉVOLUTIONNAIRE ==================
+# ================== PARTIE 2: ARCHITECTURE RÉVOLUTIONNAIRE CORRIGÉE ==================
 
 class StyleMemoryBank(nn.Module):
     """Banque de mémoire de styles pour capturer l'essence de l'anime"""
@@ -86,7 +93,7 @@ class StyleMemoryBank(nn.Module):
         self.style_dim = style_dim
         
         # Mémoire de styles appris
-        self.style_bank = nn.Parameter(torch.randn(num_styles, style_dim))
+        self.style_bank = nn.Parameter(torch.randn(num_styles, style_dim) * 0.02)
         self.style_importance = nn.Parameter(torch.ones(num_styles))
         
         # Réseau d'extraction de style
@@ -94,12 +101,12 @@ class StyleMemoryBank(nn.Module):
             nn.Linear(style_dim, style_dim * 2),
             nn.LayerNorm(style_dim * 2),
             nn.GELU(),
+            nn.Dropout(0.1),
             nn.Linear(style_dim * 2, style_dim),
         )
         
     def forward(self, x, return_weights=False):
-        """Récupère et mixe les styles pertinents"""
-        B, C = x.shape
+        B = x.shape[0]
         
         # Encoder le style d'entrée
         encoded_style = self.style_encoder(x)
@@ -129,6 +136,7 @@ class WaveletTransformLayer(nn.Module):
         ])
         
         self.fusion = nn.Conv2d(in_channels * 4, in_channels, 1)
+        self.norm = nn.GroupNorm(min(8, in_channels), in_channels)
         
     def forward(self, x):
         # Décomposition multi-échelle
@@ -138,25 +146,25 @@ class WaveletTransformLayer(nn.Module):
         
         # Fusion adaptative
         fused = torch.cat(wavelets, dim=1)
-        return self.fusion(fused) + x
+        return self.norm(self.fusion(fused)) + x
 
 class AnimeStyleAttention(nn.Module):
-    """Attention spécialisée pour les caractéristiques d'anime"""
+    """Attention spécialisée pour les caractéristiques d'anime - VERSION CORRIGÉE"""
     
     def __init__(self, dim, num_heads=8):
         super().__init__()
-        self.num_heads = num_heads
+        self.num_heads = min(num_heads, dim // 8)  # S'assurer que num_heads est valide
         self.dim = dim
-        self.head_dim = dim // num_heads
+        self.head_dim = dim // self.num_heads
         
-        # Projections spécialisées pour l'anime
+        # Projections
         self.q_proj = nn.Linear(dim, dim)
         self.k_proj = nn.Linear(dim, dim)
         self.v_proj = nn.Linear(dim, dim)
         
-        # Modulation de style anime
+        # Modulation de style
         self.style_modulation = nn.Sequential(
-            nn.Linear(dim, dim),
+            nn.Linear(512, dim),  # Toujours depuis style_dim=512
             nn.GELU(),
             nn.Linear(dim, dim),
             nn.Sigmoid()
@@ -173,7 +181,7 @@ class AnimeStyleAttention(nn.Module):
         k = self.k_proj(x).reshape(B, N, self.num_heads, self.head_dim).transpose(1, 2)
         v = self.v_proj(x).reshape(B, N, self.num_heads, self.head_dim).transpose(1, 2)
         
-        # Attention avec échelle adaptative
+        # Attention
         attn = torch.matmul(q, k.transpose(-2, -1)) / (self.head_dim ** 0.5)
         attn = F.softmax(attn, dim=-1)
         attn = self.dropout(attn)
@@ -196,24 +204,37 @@ class ContourAwareConvolution(nn.Module):
         super().__init__()
         self.main_conv = nn.Conv2d(in_channels, out_channels, kernel_size, padding=kernel_size//2)
         
-        # Détecteurs de contours spécialisés
-        self.edge_x = nn.Conv2d(in_channels, out_channels//4, 1)
-        self.edge_y = nn.Conv2d(in_channels, out_channels//4, 1)
-        self.edge_diag1 = nn.Conv2d(in_channels, out_channels//4, 1)
-        self.edge_diag2 = nn.Conv2d(in_channels, out_channels//4, 1)
+        # Détecteurs de contours
+        edge_channels = max(1, out_channels // 4)
+        self.edge_x = nn.Conv2d(in_channels, edge_channels, 1)
+        self.edge_y = nn.Conv2d(in_channels, edge_channels, 1)
+        self.edge_diag1 = nn.Conv2d(in_channels, edge_channels, 1)
+        self.edge_diag2 = nn.Conv2d(in_channels, edge_channels, 1)
         
         # Fusion
-        self.edge_fusion = nn.Conv2d(out_channels, out_channels, 1)
+        self.edge_fusion = nn.Conv2d(edge_channels * 4, out_channels, 1)
         
     def forward(self, x):
         # Convolution principale
         main = self.main_conv(x)
         
-        # Détection des contours
-        dx = self.edge_x(F.pad(x[:, :, :, 1:] - x[:, :, :, :-1], (0, 1, 0, 0)))
-        dy = self.edge_y(F.pad(x[:, :, 1:, :] - x[:, :, :-1, :], (0, 0, 0, 1)))
-        dd1 = self.edge_diag1(F.pad(x[:, :, 1:, 1:] - x[:, :, :-1, :-1], (0, 1, 0, 1)))
-        dd2 = self.edge_diag2(F.pad(x[:, :, 1:, :-1] - x[:, :, :-1, 1:], (1, 0, 0, 1)))
+        # Détection des contours avec padding approprié
+        B, C, H, W = x.shape
+        
+        # Gradients horizontaux
+        x_pad = F.pad(x, (0, 1, 0, 0))
+        dx = self.edge_x(x_pad[:, :, :, 1:] - x_pad[:, :, :, :-1])
+        
+        # Gradients verticaux
+        y_pad = F.pad(x, (0, 0, 0, 1))
+        dy = self.edge_y(y_pad[:, :, 1:, :] - y_pad[:, :, :-1, :])
+        
+        # Gradients diagonaux
+        diag_pad1 = F.pad(x, (0, 1, 0, 1))
+        dd1 = self.edge_diag1(diag_pad1[:, :, 1:H+1, 1:W+1] - diag_pad1[:, :, :H, :W])
+        
+        diag_pad2 = F.pad(x, (1, 0, 0, 1))
+        dd2 = self.edge_diag2(diag_pad2[:, :, 1:H+1, :W] - diag_pad2[:, :, :H, 1:W+1])
         
         # Combinaison
         edges = torch.cat([dx, dy, dd1, dd2], dim=1)
@@ -228,17 +249,17 @@ class AnimeGeneratorBlock(nn.Module):
         super().__init__()
         self.upsample = upsample
         
-        # Upsampling si nécessaire
+        # Upsampling
         if upsample:
             self.up = nn.ConvTranspose2d(in_channels, out_channels, 4, stride=2, padding=1)
         else:
             self.up = None
             
-        # Convolutions conscientes des contours
-        self.conv1 = ContourAwareConvolution(in_channels if not upsample else out_channels, out_channels)
+        # Convolutions
+        self.conv1 = ContourAwareConvolution(out_channels if upsample else in_channels, out_channels)
         self.conv2 = ContourAwareConvolution(out_channels, out_channels)
         
-        # Normalisation adaptative au style
+        # Normalisation
         self.norm1 = nn.InstanceNorm2d(out_channels, affine=False)
         self.norm2 = nn.InstanceNorm2d(out_channels, affine=False)
         
@@ -274,26 +295,25 @@ class AnimeGeneratorBlock(nn.Module):
         gamma2, beta2 = style2.chunk(2, dim=1)
         h = h * (1 + gamma2) + beta2
         
-        # Transformation en ondelettes pour les détails
+        # Transformation en ondelettes
         h = self.wavelet(h)
         h = self.act(h)
         
         return h
 
 class AnimeGenesisX(nn.Module):
-    """Architecture principale AnimeGenesis-X"""
+    """Architecture principale AnimeGenesis-X - VERSION CORRIGÉE"""
     
     def __init__(self, latent_dim=512, style_dim=512, num_styles=256):
         super().__init__()
         
-        # Configuration
         self.latent_dim = latent_dim
         self.style_dim = style_dim
         
         # Banque de mémoire de styles
         self.style_memory = StyleMemoryBank(num_styles, style_dim)
         
-        # Mapping network pour le style
+        # Mapping network
         self.style_mapping = nn.Sequential(
             nn.Linear(latent_dim, style_dim),
             nn.LeakyReLU(0.2),
@@ -311,7 +331,7 @@ class AnimeGenesisX(nn.Module):
             nn.ReLU(True)
         )
         
-        # Blocs de génération avec attention
+        # Blocs de génération
         self.blocks = nn.ModuleList([
             AnimeGeneratorBlock(1024, 512, style_dim, upsample=True),  # 4x4 -> 8x8
             AnimeGeneratorBlock(512, 256, style_dim, upsample=True),   # 8x8 -> 16x16
@@ -321,12 +341,12 @@ class AnimeGenesisX(nn.Module):
             AnimeGeneratorBlock(32, 16, style_dim, upsample=True),     # 128x128 -> 256x256
         ])
         
-        # Attention aux résolutions critiques
-        self.attention_32 = AnimeStyleAttention(128)
-        self.attention_64 = AnimeStyleAttention(64)
-        self.attention_128 = AnimeStyleAttention(32)
+        # Attention aux résolutions critiques (dimensions corrigées)
+        self.attention_64 = AnimeStyleAttention(64, num_heads=8)   # Après block 3
+        self.attention_128 = AnimeStyleAttention(32, num_heads=4)  # Après block 4
+        self.attention_256 = AnimeStyleAttention(16, num_heads=2)  # Après block 5
         
-        # Couche de sortie avec préservation des couleurs anime
+        # Couche de sortie
         self.to_rgb = nn.Sequential(
             ContourAwareConvolution(16, 8),
             nn.InstanceNorm2d(8),
@@ -335,7 +355,7 @@ class AnimeGenesisX(nn.Module):
             nn.Tanh()
         )
         
-        # Post-processing pour qualité supérieure
+        # Post-processing
         self.refiner = nn.Sequential(
             nn.Conv2d(3, 16, 3, padding=1),
             nn.LeakyReLU(0.2),
@@ -346,9 +366,6 @@ class AnimeGenesisX(nn.Module):
         )
         
     def forward(self, z, return_intermediates=False):
-        """
-        z: vecteur latent [B, latent_dim]
-        """
         B = z.shape[0]
         intermediates = []
         
@@ -362,27 +379,27 @@ class AnimeGenesisX(nn.Module):
         x = z.view(B, self.latent_dim, 1, 1)
         x = self.initial_layer(x)
         
-        # Passage par les blocs avec modulation de style
+        # Passage par les blocs
         for i, block in enumerate(self.blocks):
             x = block(x, w_enriched)
             
             # Attention aux résolutions importantes
-            if i == 3:  # 32x32
-                B, C, H, W = x.shape
-                x_flat = x.flatten(2).transpose(1, 2)
-                x_att = self.attention_32(x_flat, w_enriched)
-                x = x + x_att.transpose(1, 2).reshape(B, C, H, W) * 0.1
-                
-            elif i == 4:  # 64x64
+            if i == 3:  # Après block 3, on a 64 canaux à 64x64
                 B, C, H, W = x.shape
                 x_flat = x.flatten(2).transpose(1, 2)
                 x_att = self.attention_64(x_flat, w_enriched)
                 x = x + x_att.transpose(1, 2).reshape(B, C, H, W) * 0.1
                 
-            elif i == 5:  # 128x128
+            elif i == 4:  # Après block 4, on a 32 canaux à 128x128
                 B, C, H, W = x.shape
                 x_flat = x.flatten(2).transpose(1, 2)
                 x_att = self.attention_128(x_flat, w_enriched)
+                x = x + x_att.transpose(1, 2).reshape(B, C, H, W) * 0.1
+                
+            elif i == 5:  # Après block 5, on a 16 canaux à 256x256
+                B, C, H, W = x.shape
+                x_flat = x.flatten(2).transpose(1, 2)
+                x_att = self.attention_256(x_flat, w_enriched)
                 x = x + x_att.transpose(1, 2).reshape(B, C, H, W) * 0.1
             
             if return_intermediates:
@@ -404,7 +421,7 @@ class AnimeDiscriminator(nn.Module):
     def __init__(self):
         super().__init__()
         
-        # Extracteur de caractéristiques multi-échelles
+        # Extracteur de caractéristiques
         self.features = nn.ModuleList([
             nn.Sequential(
                 nn.Conv2d(3, 32, 4, stride=2, padding=1),
@@ -432,12 +449,13 @@ class AnimeDiscriminator(nn.Module):
             ),
         ])
         
-        # Classificateur final
+        # Classificateur
         self.classifier = nn.Sequential(
             nn.AdaptiveAvgPool2d(1),
             nn.Flatten(),
             nn.Linear(512, 256),
             nn.LeakyReLU(0.2),
+            nn.Dropout(0.3),
             nn.Linear(256, 1)
         )
         
@@ -449,12 +467,11 @@ class AnimeDiscriminator(nn.Module):
             h = layer(h)
             features.append(h)
         
-        # Classification
         validity = self.classifier(h)
         
         return validity, features
 
-# ================== PARTIE 3: SYSTÈME D'ENTRAÎNEMENT AVANCÉ ==================
+# ================== PARTIE 3: SYSTÈME D'ENTRAÎNEMENT AMÉLIORÉ ==================
 
 class AnimeTrainer:
     """Système d'entraînement complet pour AnimeGenesis-X"""
@@ -464,22 +481,27 @@ class AnimeTrainer:
         self.D = discriminator.to(device)
         self.device = device
         
-        # Optimiseurs avec paramètres optimisés
+        # Optimiseurs
         self.opt_G = torch.optim.Adam(self.G.parameters(), lr=0.0002, betas=(0.5, 0.999))
         self.opt_D = torch.optim.Adam(self.D.parameters(), lr=0.0002, betas=(0.5, 0.999))
+        
+        # Schedulers pour ajuster le learning rate
+        self.scheduler_G = torch.optim.lr_scheduler.StepLR(self.opt_G, step_size=30, gamma=0.5)
+        self.scheduler_D = torch.optim.lr_scheduler.StepLR(self.opt_D, step_size=30, gamma=0.5)
         
         # Dataset
         self.dataset = AnimeDataset(dataset_path, image_size=256)
         self.dataloader = DataLoader(
             self.dataset, 
-            batch_size=8,  # Ajuste selon ta VRAM
+            batch_size=4 if device.type == 'cuda' else 2,  # Réduit pour économiser la mémoire
             shuffle=True,
-            num_workers=4,
-            pin_memory=True
+            num_workers=2,
+            pin_memory=True if device.type == 'cuda' else False
         )
         
         # Métriques
         self.losses = {'G': [], 'D': [], 'D_real': [], 'D_fake': []}
+        self.iteration = 0
         
         # Créer dossiers de sortie
         os.makedirs('outputs', exist_ok=True)
@@ -490,9 +512,9 @@ class AnimeTrainer:
         B = real_images.size(0)
         real_images = real_images.to(self.device)
         
-        # Labels
-        real_label = torch.ones(B, 1).to(self.device)
-        fake_label = torch.zeros(B, 1).to(self.device)
+        # Labels avec label smoothing
+        real_label = torch.ones(B, 1).to(self.device) * 0.9  # Label smoothing
+        fake_label = torch.zeros(B, 1).to(self.device) + 0.1
         
         # ============= Entraîner le Discriminateur =============
         self.opt_D.zero_grad()
@@ -507,9 +529,13 @@ class AnimeTrainer:
         fake_validity, fake_features = self.D(fake_images.detach())
         d_fake_loss = F.binary_cross_entropy_with_logits(fake_validity, fake_label)
         
+        # Gradient penalty (pour stabilité)
+        gradient_penalty = self.compute_gradient_penalty(real_images, fake_images.detach())
+        
         # Total discriminator loss
-        d_loss = (d_real_loss + d_fake_loss) / 2
+        d_loss = (d_real_loss + d_fake_loss) / 2 + gradient_penalty * 0.1
         d_loss.backward()
+        torch.nn.utils.clip_grad_norm_(self.D.parameters(), 1.0)
         self.opt_D.step()
         
         # ============= Entraîner le Générateur =============
@@ -523,14 +549,15 @@ class AnimeTrainer:
         # Adversarial loss
         g_adv_loss = F.binary_cross_entropy_with_logits(validity, real_label)
         
-        # Feature matching loss (pour stabilité)
+        # Feature matching loss
         fm_loss = 0
-        for rf, gf in zip(real_features, gen_features):
+        for rf, gf in zip(real_features[:-1], gen_features[:-1]):  # Skip last layer
             fm_loss += F.l1_loss(gf, rf.detach()) * 0.01
         
         # Total generator loss
         g_loss = g_adv_loss + fm_loss
         g_loss.backward()
+        torch.nn.utils.clip_grad_norm_(self.G.parameters(), 1.0)
         self.opt_G.step()
         
         # Enregistrer les losses
@@ -538,6 +565,7 @@ class AnimeTrainer:
         self.losses['D'].append(d_loss.item())
         self.losses['D_real'].append(d_real_loss.item())
         self.losses['D_fake'].append(d_fake_loss.item())
+        self.iteration += 1
         
         return {
             'g_loss': g_loss.item(),
@@ -546,11 +574,31 @@ class AnimeTrainer:
             'd_fake': d_fake_loss.item()
         }
     
+    def compute_gradient_penalty(self, real_samples, fake_samples):
+        """Calcule le gradient penalty pour WGAN-GP"""
+        alpha = torch.rand(real_samples.size(0), 1, 1, 1).to(self.device)
+        interpolates = (alpha * real_samples + ((1 - alpha) * fake_samples)).requires_grad_(True)
+        d_interpolates, _ = self.D(interpolates)
+        
+        gradients = torch.autograd.grad(
+            outputs=d_interpolates,
+            inputs=interpolates,
+            grad_outputs=torch.ones_like(d_interpolates),
+            create_graph=True,
+            retain_graph=True,
+            only_inputs=True,
+        )[0]
+        
+        gradients = gradients.view(gradients.size(0), -1)
+        gradient_penalty = ((gradients.norm(2, dim=1) - 1) ** 2).mean()
+        return gradient_penalty
+    
     def train(self, num_epochs=100):
         """Boucle d'entraînement principale"""
         print("🚀 Début de l'entraînement AnimeGenesis-X")
         print("=" * 50)
         
+        # Vecteur fixe pour visualisation
         fixed_z = torch.randn(16, self.G.latent_dim).to(self.device)
         
         for epoch in range(num_epochs):
@@ -558,12 +606,15 @@ class AnimeTrainer:
             
             with tqdm(self.dataloader, desc=f'Epoch {epoch+1}/{num_epochs}') as pbar:
                 for i, real_images in enumerate(pbar):
+                    if real_images.size(0) < 2:  # Skip si batch trop petit
+                        continue
+                        
                     losses = self.train_step(real_images)
                     
                     epoch_losses['G'].append(losses['g_loss'])
                     epoch_losses['D'].append(losses['d_loss'])
                     
-                    # Mise à jour de la barre de progression
+                    # Mise à jour de la barre
                     pbar.set_postfix({
                         'G': f"{losses['g_loss']:.4f}",
                         'D': f"{losses['d_loss']:.4f}",
@@ -571,21 +622,27 @@ class AnimeTrainer:
                         'D_f': f"{losses['d_fake']:.4f}"
                     })
                     
-                    # Sauvegarder des échantillons périodiquement
-                    if i % 100 == 0:
-                        self.save_samples(fixed_z, epoch, i)
+                    # Sauvegarder des échantillons
+                    if self.iteration % 50 == 0:
+                        self.save_samples(fixed_z, epoch, self.iteration)
             
-            # Statistiques d'époque
-            avg_g = np.mean(epoch_losses['G'])
-            avg_d = np.mean(epoch_losses['D'])
-            print(f"\n📊 Epoch {epoch+1} - G Loss: {avg_g:.4f}, D Loss: {avg_d:.4f}")
+            # Mise à jour des schedulers
+            self.scheduler_G.step()
+            self.scheduler_D.step()
+            
+            # Statistiques
+            if len(epoch_losses['G']) > 0:
+                avg_g = np.mean(epoch_losses['G'])
+                avg_d = np.mean(epoch_losses['D'])
+                print(f"\n📊 Epoch {epoch+1} - G Loss: {avg_g:.4f}, D Loss: {avg_d:.4f}")
+                print(f"   LR: G={self.scheduler_G.get_last_lr()[0]:.6f}, D={self.scheduler_D.get_last_lr()[0]:.6f}")
             
             # Sauvegarder le modèle
-            if (epoch + 1) % 10 == 0:
+            if (epoch + 1) % 5 == 0:
                 self.save_checkpoint(epoch + 1)
             
-            # Graphiques de progression
-            if (epoch + 1) % 5 == 0:
+            # Graphiques
+            if (epoch + 1) % 2 == 0:
                 self.plot_losses()
     
     @torch.no_grad()
@@ -594,15 +651,13 @@ class AnimeTrainer:
         self.G.eval()
         
         fake_images = self.G(fixed_z)
-        
-        # Dénormaliser
-        fake_images = fake_images * 0.5 + 0.5
+        fake_images = fake_images * 0.5 + 0.5  # Dénormaliser
         
         # Créer une grille
         grid = make_grid(fake_images, nrow=4, padding=2, normalize=False)
         
         # Sauvegarder
-        save_path = f'outputs/epoch_{epoch:04d}_step_{step:05d}.png'
+        save_path = f'outputs/epoch_{epoch:04d}_iter_{step:06d}.png'
         save_image(grid, save_path)
         
         self.G.train()
@@ -615,6 +670,8 @@ class AnimeTrainer:
             'discriminator': self.D.state_dict(),
             'opt_g': self.opt_G.state_dict(),
             'opt_d': self.opt_D.state_dict(),
+            'scheduler_g': self.scheduler_G.state_dict(),
+            'scheduler_d': self.scheduler_D.state_dict(),
             'losses': self.losses
         }
         
@@ -624,31 +681,54 @@ class AnimeTrainer:
     
     def plot_losses(self):
         """Visualiser les courbes de loss"""
-        plt.figure(figsize=(12, 4))
+        if len(self.losses['G']) < 10:
+            return
+            
+        plt.figure(figsize=(15, 5))
         
-        plt.subplot(1, 2, 1)
-        plt.plot(self.losses['G'], label='Generator', alpha=0.7)
-        plt.plot(self.losses['D'], label='Discriminator', alpha=0.7)
+        # Smooth les courbes
+        def smooth(y, box_pts=10):
+            box = np.ones(box_pts)/box_pts
+            y_smooth = np.convolve(y, box, mode='valid')
+            return y_smooth
+        
+        plt.subplot(1, 3, 1)
+        if len(self.losses['G']) > 10:
+            plt.plot(smooth(self.losses['G']), label='Generator', alpha=0.7, color='blue')
+            plt.plot(smooth(self.losses['D']), label='Discriminator', alpha=0.7, color='orange')
         plt.xlabel('Iteration')
         plt.ylabel('Loss')
         plt.legend()
-        plt.title('Training Losses')
+        plt.title('Training Losses (Smoothed)')
         plt.grid(True, alpha=0.3)
         
-        plt.subplot(1, 2, 2)
-        plt.plot(self.losses['D_real'], label='D(real)', alpha=0.7)
-        plt.plot(self.losses['D_fake'], label='D(fake)', alpha=0.7)
+        plt.subplot(1, 3, 2)
+        if len(self.losses['D_real']) > 10:
+            plt.plot(smooth(self.losses['D_real']), label='D(real)', alpha=0.7, color='green')
+            plt.plot(smooth(self.losses['D_fake']), label='D(fake)', alpha=0.7, color='red')
         plt.xlabel('Iteration')
         plt.ylabel('Loss')
         plt.legend()
-        plt.title('Discriminator Details')
+        plt.title('Discriminator Details (Smoothed)')
         plt.grid(True, alpha=0.3)
+        
+        plt.subplot(1, 3, 3)
+        # Histogramme des dernières valeurs
+        last_100_g = self.losses['G'][-100:] if len(self.losses['G']) > 100 else self.losses['G']
+        last_100_d = self.losses['D'][-100:] if len(self.losses['D']) > 100 else self.losses['D']
+        
+        plt.hist(last_100_g, alpha=0.5, label='G (last 100)', bins=20, color='blue')
+        plt.hist(last_100_d, alpha=0.5, label='D (last 100)', bins=20, color='orange')
+        plt.xlabel('Loss Value')
+        plt.ylabel('Frequency')
+        plt.legend()
+        plt.title('Loss Distribution')
         
         plt.tight_layout()
         plt.savefig('outputs/losses.png', dpi=100)
         plt.close()
 
-# ================== PARTIE 4: INTERFACE DE TEST ==================
+# ================== PARTIE 4: GÉNÉRATEUR POUR TESTS ==================
 
 class AnimeGenerator:
     """Interface simple pour générer des images"""
@@ -660,7 +740,7 @@ class AnimeGenerator:
         # Créer le modèle
         self.model = AnimeGenesisX().to(self.device)
         
-        # Charger checkpoint si disponible
+        # Charger checkpoint
         if checkpoint_path and os.path.exists(checkpoint_path):
             checkpoint = torch.load(checkpoint_path, map_location=self.device)
             self.model.load_state_dict(checkpoint['generator'])
@@ -677,13 +757,8 @@ class AnimeGenerator:
             torch.manual_seed(seed)
             np.random.seed(seed)
         
-        # Générer vecteurs latents
         z = torch.randn(num_images, self.model.latent_dim).to(self.device)
-        
-        # Générer images
         images = self.model(z)
-        
-        # Dénormaliser
         images = images * 0.5 + 0.5
         images = torch.clamp(images, 0, 1)
         
@@ -700,8 +775,8 @@ class AnimeGenerator:
             save_image(img, save_path)
             print(f"✅ Image sauvegardée: {save_path}")
         
-        # Créer aussi une grille
-        grid = make_grid(images, nrow=2, padding=2)
+        # Grille
+        grid = make_grid(images, nrow=min(2, num_images), padding=2)
         grid_path = os.path.join(output_dir, 'grid.png')
         save_image(grid, grid_path)
         print(f"🎨 Grille sauvegardée: {grid_path}")
@@ -714,12 +789,12 @@ def main():
     print("""
     ╔══════════════════════════════════════════════════════════╗
     ║         AnimeGenesis-X : Générateur d'Anime IA          ║
-    ║                    Version 1.0 BETA                      ║
+    ║                    Version 1.1 FIXED                     ║
     ╚══════════════════════════════════════════════════════════╝
     """)
     
     # Configuration
-    DATASET_PATH = "/kaggle/input/anima-s-dataset/test/"  # 👈 CHANGE CE CHEMIN VERS TON DATASET
+    DATASET_PATH = "/kaggle/input/anima-s-dataset/test/"  # 👈 CHANGE CE CHEMIN
     TRAIN_MODE = True  # Mettre False pour juste générer
     
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -730,24 +805,21 @@ def main():
         print(f"💾 VRAM: {torch.cuda.get_device_properties(0).total_memory / 1e9:.2f} GB")
     
     if TRAIN_MODE:
-        # ========== MODE ENTRAÎNEMENT ==========
+        # MODE ENTRAÎNEMENT
         print("\n🎯 Mode: ENTRAÎNEMENT")
         
-        # Vérifier le dataset
+        # Créer le dossier dataset s'il n'existe pas
         if not os.path.exists(DATASET_PATH):
-            print(f"\n⚠️ ATTENTION: Le dossier '{DATASET_PATH}' n'existe pas!")
-            print("📁 Création du dossier...")
             os.makedirs(DATASET_PATH)
-            print(f"👉 Place tes images d'anime dans: {os.path.abspath(DATASET_PATH)}")
-            print("   Formats supportés: .jpg, .png, .jpeg, .webp")
-            return
+            print(f"\n📁 Dossier créé: {os.path.abspath(DATASET_PATH)}")
+            print("👉 Place tes images d'anime dans ce dossier ou continue avec des images de test")
         
         # Créer les modèles
         print("\n🔨 Création des modèles...")
         generator = AnimeGenesisX(latent_dim=512, style_dim=512, num_styles=256)
         discriminator = AnimeDiscriminator()
         
-        # Compter les paramètres
+        # Statistiques
         g_params = sum(p.numel() for p in generator.parameters()) / 1e6
         d_params = sum(p.numel() for p in discriminator.parameters()) / 1e6
         print(f"📊 Générateur: {g_params:.2f}M paramètres")
@@ -758,34 +830,31 @@ def main():
         
         # Lancer l'entraînement
         print("\n🚀 Lancement de l'entraînement...")
-        print("💡 Conseil: Les images seront sauvées dans 'outputs/'")
-        print("⌛ Cela peut prendre plusieurs heures selon ton GPU\n")
+        print("💡 Les images seront sauvées dans 'outputs/'")
+        print("⏱️ Temps estimé: 10-30 min pour premiers résultats\n")
         
-        trainer.train(num_epochs=100)  # Ajuste le nombre d'époques
+        trainer.train(num_epochs=100)
         
     else:
-        # ========== MODE GÉNÉRATION ==========
+        # MODE GÉNÉRATION
         print("\n🎯 Mode: GÉNÉRATION")
         
-        # Chercher le dernier checkpoint
         checkpoints = glob.glob('checkpoints/*.pth')
         if checkpoints:
             latest_checkpoint = max(checkpoints, key=os.path.getctime)
             print(f"📁 Checkpoint trouvé: {latest_checkpoint}")
         else:
             latest_checkpoint = None
-            print("⚠️ Aucun checkpoint trouvé, génération avec poids aléatoires")
+            print("⚠️ Aucun checkpoint, génération avec poids aléatoires")
         
-        # Créer le générateur
         gen = AnimeGenerator(latest_checkpoint)
         
-        # Générer des images
-        print("\n🎨 Génération d'images d'anime...")
-        gen.generate_and_save(num_images=16)
+        print("\n🎨 Génération d'images...")
+        gen.generate_and_save(num_images=8)
         
-        print("\n✅ Génération terminée! Vérifie le dossier 'generated/'")
+        print("\n✅ Génération terminée! Vérifie 'generated/'")
     
-    print("\n🌟 Terminé!")
+    print("\n🌟 Programme terminé avec succès!")
 
 if __name__ == "__main__":
     main()

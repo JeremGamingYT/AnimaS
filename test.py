@@ -15,7 +15,7 @@ from datetime import datetime
 # ==================== Configuration ====================
 class Config:
     # Chemins
-    FRAMES_DIR = "anime_frames"  # Dossier contenant les frames
+    FRAMES_DIR = "/kaggle/input/anima-s-dataset/test"  # Dossier contenant les frames
     CHECKPOINT_DIR = "checkpoints"
     OUTPUT_DIR = "predictions"
     

@@ -648,6 +648,46 @@ class UNetEditor(nn.Module):
         self.load_state_dict(own)
 
 
+class UNetTranslator(nn.Module):
+    """Image-to-image UNet that maps x_t -> x_{t+1}. Matches UNetAutoencoder toplogy."""
+    def __init__(self, image_size: int = 128, base_channels: int = 64, bottleneck_channels: int = 512) -> None:
+        super().__init__()
+        c = base_channels
+        self.e1 = nn.Sequential(nn.Conv2d(3, c, 3, 1, 1), nn.ReLU(inplace=True), nn.Conv2d(c, c, 3, 1, 1), nn.ReLU(inplace=True))
+        self.d1 = nn.Conv2d(c, c, 4, 2, 1)
+        self.e2 = nn.Sequential(nn.Conv2d(c, c * 2, 3, 1, 1), nn.ReLU(inplace=True), nn.Conv2d(c * 2, c * 2, 3, 1, 1), nn.ReLU(inplace=True))
+        self.d2 = nn.Conv2d(c * 2, c * 2, 4, 2, 1)
+        self.e3 = nn.Sequential(nn.Conv2d(c * 2, c * 4, 3, 1, 1), nn.ReLU(inplace=True), nn.Conv2d(c * 4, c * 4, 3, 1, 1), nn.ReLU(inplace=True))
+        self.bottleneck = nn.Sequential(nn.Conv2d(c * 4, bottleneck_channels, 3, 1, 1), nn.ReLU(inplace=True))
+
+        self.u3 = nn.ConvTranspose2d(bottleneck_channels, c * 4, 4, 2, 1)
+        self.d3 = nn.Sequential(nn.Conv2d(c * 6, c * 4, 3, 1, 1), nn.ReLU(inplace=True))
+        self.u2 = nn.ConvTranspose2d(c * 4, c * 2, 4, 2, 1)
+        self.d4 = nn.Sequential(nn.Conv2d(c * 3, c * 2, 3, 1, 1), nn.ReLU(inplace=True))
+        self.out = nn.Sequential(nn.Conv2d(c * 2, c, 3, 1, 1), nn.ReLU(inplace=True), nn.Conv2d(c, 3, 3, 1, 1), nn.Tanh())
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        s1 = self.e1(x)
+        p1 = F.relu(self.d1(s1))
+        s2 = self.e2(p1)
+        p2 = F.relu(self.d2(s2))
+        s3 = self.e3(p2)
+        b = self.bottleneck(s3)
+        x = self.u3(b)
+        x = self.d3(torch.cat([x, s2], dim=1))
+        x = self.u2(x)
+        x = self.d4(torch.cat([x, s1], dim=1))
+        x = self.out(x)
+        return x
+
+    def init_from_unet_autoencoder(self, ae_state: dict) -> None:
+        own = self.state_dict()
+        for k, v in ae_state.items():
+            if k in own and own[k].shape == v.shape:
+                own[k].copy_(v)
+        self.load_state_dict(own)
+
+
 def sobel_edge_loss(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
     # x,y in [-1,1]; compute gradients per-channel
     kx = torch.tensor([[1, 0, -1], [2, 0, -2], [1, 0, -1]], dtype=torch.float32, device=x.device).view(1, 1, 3, 3)
@@ -1126,6 +1166,133 @@ def evaluate_next_frame(
     return {"psnr": sum(psnr_list)/max(1,len(psnr_list)), "ssim": sum(ssim_list)/max(1,len(ssim_list))}
 
 
+def train_predictor_ae(
+    data_root: str,
+    ae_ckpt: str,
+    out_path: str,
+    image_size: int = 128,
+    batch_size: int = 8,
+    epochs: int = 8,
+    lr: float = 1e-4,
+    base_channels: int = 64,
+    bottleneck_channels: int = 512,
+    device: str = "cuda",
+) -> str:
+    device_t = torch.device(device if torch.cuda.is_available() or device == "cpu" else "cpu")
+    ds = FramePairDataset(root=data_root, image_size=image_size, is_train=True)
+    dl = DataLoader(ds, batch_size=batch_size, shuffle=True, num_workers=4, pin_memory=True)
+
+    # Initialize from AE weights
+    ckpt = torch.load(ae_ckpt, map_location="cpu")
+    ae_cfg = AEConfig(**ckpt["config"])  # type: ignore[arg-type]
+    arch = ckpt.get("arch", "unet")
+    translator = UNetTranslator(image_size=image_size, base_channels=base_channels, bottleneck_channels=bottleneck_channels).to(device_t)
+    if arch == "unet":
+        ae_model = UNetAutoencoder(ae_cfg)
+        ae_model.load_state_dict(ckpt["state_dict"])  # type: ignore[index]
+        translator.init_from_unet_autoencoder(ae_model.state_dict())
+
+    opt = torch.optim.Adam(translator.parameters(), lr=lr)
+    l1 = nn.L1Loss()
+
+    translator.train()
+    last_batch = None
+    for epoch in range(1, epochs + 1):
+        pbar = tqdm(dl, desc=f"PredictorAE {epoch}/{epochs}")
+        for x_t, x_tp1 in pbar:
+            x_t = x_t.to(device_t, non_blocking=True)
+            x_tp1 = x_tp1.to(device_t, non_blocking=True)
+            last_batch = (x_t, x_tp1)
+            y = translator(x_t)
+            loss_rec = l1(y, x_tp1)
+            loss_edge = sobel_edge_loss(y, x_tp1)
+            loss_ssim = ssim_loss_simple(y, x_tp1)
+            loss = loss_rec + 0.1 * loss_edge + 0.5 * loss_ssim
+            opt.zero_grad(set_to_none=True)
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(translator.parameters(), 1.0)
+            opt.step()
+            pbar.set_postfix({"l1": float(loss_rec)})
+
+        if last_batch is not None:
+            translator.eval()
+            with torch.no_grad():
+                vis = translator(last_batch[0][:1])
+            save_image_grid(last_batch[0][:1], vis, Path("samples/predictor_ae"), f"epoch_{epoch:03d}.png")
+            translator.train()
+
+    out_path_p = Path(out_path)
+    out_path_p.parent.mkdir(parents=True, exist_ok=True)
+    torch.save({"state_dict": translator.state_dict(), "config": {"image_size": image_size, "base_channels": base_channels, "bottleneck_channels": bottleneck_channels}}, out_path_p)
+    return str(out_path_p)
+
+
+@torch.no_grad()
+def predict_next_ae(
+    image_path: str,
+    predictor_ckpt: str,
+    out_path: str = "outputs_next/predictor_ae.png",
+    device: str = "cuda",
+) -> str:
+    device_t = torch.device(device if torch.cuda.is_available() or device == "cpu" else "cpu")
+    ckpt = torch.load(predictor_ckpt, map_location="cpu")
+    cfg = ckpt["config"]  # type: ignore[index]
+    translator = UNetTranslator(image_size=int(cfg["image_size"]), base_channels=int(cfg["base_channels"]), bottleneck_channels=int(cfg["bottleneck_channels"]))
+    translator.load_state_dict(ckpt["state_dict"])  # type: ignore[index]
+    translator = translator.to(device_t)
+    translator.eval()
+
+    img = Image.open(image_path).convert("RGB")
+    tfm = T.Compose([
+        T.Resize(int(cfg["image_size"]), interpolation=T.InterpolationMode.BICUBIC, antialias=True),
+        T.CenterCrop(int(cfg["image_size"])),
+        T.ToTensor(),
+        T.Normalize([0.5, 0.5, 0.5], [0.5, 0.5, 0.5]),
+    ])
+    x = tfm(img).unsqueeze(0).to(device_t)
+    y = translator(x)
+    out_path_p = Path(out_path)
+    out_path_p.parent.mkdir(parents=True, exist_ok=True)
+    save_image_grid(x, y, out_path_p.parent, out_path_p.name)
+    return str(out_path_p)
+
+
+def eval_next_ae(
+    data_root: str,
+    predictor_ckpt: str,
+    image_size: int = 128,
+    batch_size: int = 4,
+    num_batches: int = 10,
+    device: str = "cuda",
+) -> dict:
+    device_t = torch.device(device if torch.cuda.is_available() or device == "cpu" else "cpu")
+    ckpt = torch.load(predictor_ckpt, map_location="cpu")
+    cfg = ckpt["config"]  # type: ignore[index]
+    translator = UNetTranslator(image_size=int(cfg["image_size"]), base_channels=int(cfg["base_channels"]), bottleneck_channels=int(cfg["bottleneck_channels"]))
+    translator.load_state_dict(ckpt["state_dict"])  # type: ignore[index]
+    translator = translator.to(device_t)
+    translator.eval()
+
+    ds = FramePairDataset(root=data_root, image_size=image_size, is_train=False)
+    dl = DataLoader(ds, batch_size=batch_size, shuffle=True, num_workers=2, pin_memory=True)
+
+    psnr_vals: List[float] = []
+    ssim_vals: List[float] = []
+    processed = 0
+    for x_t, x_tp1 in dl:
+        x_t = x_t.to(device_t)
+        x_tp1 = x_tp1.to(device_t)
+        with torch.no_grad():
+            y = translator(x_t)
+        for i in range(x_t.shape[0]):
+            psnr_vals.append(float(psnr_value(y[i:i+1], x_tp1[i:i+1]).item()))
+            ssim_vals.append(float(ssim_value(y[i:i+1], x_tp1[i:i+1]).item()))
+        processed += 1
+        if processed >= num_batches:
+            break
+    return {"psnr": sum(psnr_vals)/max(1,len(psnr_vals)), "ssim": sum(ssim_vals)/max(1,len(ssim_vals))}
+
+
 def train_editor(
     data_root: str,
     vqvae_ckpt: str,
@@ -1595,6 +1762,32 @@ def parse_cli() -> argparse.Namespace:
     p_edit_unet.add_argument("--out", type=str, default="outputs_edit/edited_unet.png")
     p_edit_unet.add_argument("--device", type=str, default="cuda")
 
+    p_pred_ae_train = sub.add_parser("train_predictor_ae")
+    p_pred_ae_train.add_argument("--data-root", type=str, required=True)
+    p_pred_ae_train.add_argument("--ae", type=str, required=True)
+    p_pred_ae_train.add_argument("--out", type=str, default="checkpoints/predictor_ae.pt")
+    p_pred_ae_train.add_argument("--image-size", type=int, default=128)
+    p_pred_ae_train.add_argument("--batch-size", type=int, default=8)
+    p_pred_ae_train.add_argument("--epochs", type=int, default=8)
+    p_pred_ae_train.add_argument("--lr", type=float, default=1e-4)
+    p_pred_ae_train.add_argument("--base-channels", type=int, default=64)
+    p_pred_ae_train.add_argument("--bottleneck-channels", type=int, default=512)
+    p_pred_ae_train.add_argument("--device", type=str, default="cuda")
+
+    p_pred_ae = sub.add_parser("predict_next_ae")
+    p_pred_ae.add_argument("--image", type=str, required=True)
+    p_pred_ae.add_argument("--predictor", type=str, required=True)
+    p_pred_ae.add_argument("--out", type=str, default="outputs_next/predictor_ae.png")
+    p_pred_ae.add_argument("--device", type=str, default="cuda")
+
+    p_eval_ae = sub.add_parser("eval_next_ae")
+    p_eval_ae.add_argument("--data-root", type=str, required=True)
+    p_eval_ae.add_argument("--predictor", type=str, required=True)
+    p_eval_ae.add_argument("--image-size", type=int, default=128)
+    p_eval_ae.add_argument("--batch-size", type=int, default=4)
+    p_eval_ae.add_argument("--num-batches", type=int, default=10)
+    p_eval_ae.add_argument("--device", type=str, default="cuda")
+
     return p.parse_args()
 
 
@@ -1709,6 +1902,38 @@ def main() -> None:
             device=args.device,
         )
         print(f"Saved edited image to {out}")
+    elif args.cmd == "train_predictor_ae":
+        ckpt = train_predictor_ae(
+            data_root=args.data_root,
+            ae_ckpt=args.ae,
+            out_path=args.out,
+            image_size=args.image_size,
+            batch_size=args.batch_size,
+            epochs=args.epochs,
+            lr=args.lr,
+            base_channels=args.base_channels,
+            bottleneck_channels=args.bottleneck_channels,
+            device=args.device,
+        )
+        print(f"Saved PredictorAE: {ckpt}")
+    elif args.cmd == "predict_next_ae":
+        out = predict_next_ae(
+            image_path=args.image,
+            predictor_ckpt=args.predictor,
+            out_path=args.out,
+            device=args.device,
+        )
+        print(f"Saved predicted frame to {out}")
+    elif args.cmd == "eval_next_ae":
+        metrics = eval_next_ae(
+            data_root=args.data_root,
+            predictor_ckpt=args.predictor,
+            image_size=args.image_size,
+            batch_size=args.batch_size,
+            num_batches=args.num_batches,
+            device=args.device,
+        )
+        print({"psnr": round(metrics["psnr"], 3), "ssim": round(metrics["ssim"], 4)})
     elif args.cmd == "train_editor":
         ckpt, meta = train_editor(
             data_root=args.data_root,

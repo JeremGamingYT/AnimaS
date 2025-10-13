@@ -25,35 +25,32 @@ class Config:
     CHECKPOINT_DIR = "checkpoints"
     OUTPUT_DIR = "predictions"
     
-    # Hyperparamètres - Optimisés pour qualité
+    # Hyperparamètres - Optimisés pour 12GB VRAM
     SEQUENCE_LENGTH = 3
-    IMG_SIZE = (256, 256)  # On augmente pour plus de détails
-    PATCH_SIZE = (64, 64)  # Taille des patches pour l'entraînement progressif
+    IMG_SIZE = (256, 256)
     BATCH_SIZE = 1
     GRADIENT_ACCUMULATION_STEPS = 8
     LEARNING_RATE_G = 0.0001
     LEARNING_RATE_D = 0.00005
-    LEARNING_RATE_R = 0.0001  # Pour le refinement network
     NUM_EPOCHS = 300
     DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     
     # Architecture
-    HIDDEN_DIM = 256
-    NUM_LAYERS = 2
+    ENCODER_DIM = 512  # Dimension finale de l'encoder
+    LATENT_DIM = 16    # Taille spatiale après encoding (16x16)
     
-    # Loss weights - Ajustés pour la qualité
-    RECONSTRUCTION_WEIGHT = 50.0  # Nouveau : pour la reconstruction parfaite
+    # Loss weights
+    RECONSTRUCTION_WEIGHT = 50.0
     L1_WEIGHT = 100.0
-    PERCEPTUAL_WEIGHT = 20.0  # Augmenté pour plus de détails
-    TEXTURE_WEIGHT = 10.0  # Nouveau : pour les détails fins
-    EDGE_WEIGHT = 5.0  # Nouveau : pour les contours nets
+    PERCEPTUAL_WEIGHT = 20.0
+    TEXTURE_WEIGHT = 10.0
+    EDGE_WEIGHT = 5.0
     GAN_WEIGHT = 1.0
-    SSIM_WEIGHT = 10.0  # Nouveau : structural similarity
+    SSIM_WEIGHT = 10.0
     
     # Training
     USE_MIXED_PRECISION = True
     CLIP_GRAD_NORM = 1.0
-    USE_PROGRESSIVE_TRAINING = True  # Entraînement progressif pour la qualité
 
 # ==================== Module de Super-Résolution ====================
 class ResidualBlock(nn.Module):
@@ -75,19 +72,16 @@ class ResidualBlock(nn.Module):
 
 class QualityRefinementModule(nn.Module):
     """Module pour raffiner la qualité des images générées"""
-    def __init__(self, in_channels=3, num_blocks=8):
+    def __init__(self, in_channels=3, num_blocks=6):
         super().__init__()
         
-        # Extraction de features multi-échelle
         self.initial = nn.Sequential(
             nn.Conv2d(in_channels, 64, 9, padding=4),
             nn.ReLU(inplace=True)
         )
         
-        # Residual blocks pour capturer les détails
         self.res_blocks = nn.Sequential(*[ResidualBlock(64) for _ in range(num_blocks)])
         
-        # Reconstruction haute qualité
         self.reconstruction = nn.Sequential(
             nn.Conv2d(64, 64, 3, padding=1),
             nn.BatchNorm2d(64),
@@ -116,7 +110,7 @@ class HighQualityGenerator(nn.Module):
                 nn.Conv2d(3, 64, 4, 2, 1),
                 nn.BatchNorm2d(64),
                 nn.LeakyReLU(0.2),
-                ResidualBlock(64),  # Détails haute fréquence
+                ResidualBlock(64),
             ),
             # Level 2: 128 -> 64
             nn.Sequential(
@@ -134,48 +128,52 @@ class HighQualityGenerator(nn.Module):
             ),
             # Level 4: 32 -> 16
             nn.Sequential(
-                nn.Conv2d(256, 512, 4, 2, 1),
-                nn.BatchNorm2d(512),
+                nn.Conv2d(256, config.ENCODER_DIM, 4, 2, 1),
+                nn.BatchNorm2d(config.ENCODER_DIM),
                 nn.LeakyReLU(0.2),
-                ResidualBlock(512),
+                ResidualBlock(config.ENCODER_DIM),
             )
         ])
         
         # ========== TEMPORAL MODULE ==========
+        # Calculer la taille correcte pour le LSTM
+        self.temporal_input_size = config.ENCODER_DIM * config.LATENT_DIM * config.LATENT_DIM
+        self.temporal_hidden_size = self.temporal_input_size  # Même taille pour pouvoir reshape
+        
         self.temporal_module = nn.LSTM(
-            input_size=512 * 16 * 16,  # Flatten features
-            hidden_size=2048,
+            input_size=self.temporal_input_size,
+            hidden_size=self.temporal_hidden_size,
             num_layers=2,
-            batch_first=True
+            batch_first=True,
+            dropout=0.1
         )
         
         # ========== RECONSTRUCTION DECODER ==========
-        # Pour reconstruire parfaitement l'image d'entrée
         self.reconstruction_decoder = nn.ModuleList([
             # Level 4: 16 -> 32
             nn.Sequential(
-                nn.ConvTranspose2d(512, 256, 4, 2, 1),
+                nn.ConvTranspose2d(config.ENCODER_DIM, 256, 4, 2, 1),
                 nn.BatchNorm2d(256),
                 nn.ReLU(),
                 ResidualBlock(256),
             ),
-            # Level 3: 32 -> 64
+            # Level 3: 32 -> 64 (avec skip connection)
             nn.Sequential(
-                nn.ConvTranspose2d(256 + 256, 128, 4, 2, 1),  # +256 pour skip connection
+                nn.ConvTranspose2d(256 + 256, 128, 4, 2, 1),
                 nn.BatchNorm2d(128),
                 nn.ReLU(),
                 ResidualBlock(128),
             ),
-            # Level 2: 64 -> 128
+            # Level 2: 64 -> 128 (avec skip connection)
             nn.Sequential(
-                nn.ConvTranspose2d(128 + 128, 64, 4, 2, 1),  # +128 pour skip
+                nn.ConvTranspose2d(128 + 128, 64, 4, 2, 1),
                 nn.BatchNorm2d(64),
                 nn.ReLU(),
                 ResidualBlock(64),
             ),
-            # Level 1: 128 -> 256
+            # Level 1: 128 -> 256 (avec skip connection)
             nn.Sequential(
-                nn.ConvTranspose2d(64 + 64, 32, 4, 2, 1),  # +64 pour skip
+                nn.ConvTranspose2d(64 + 64, 32, 4, 2, 1),
                 nn.BatchNorm2d(32),
                 nn.ReLU(),
                 nn.Conv2d(32, 3, 3, 1, 1),
@@ -184,11 +182,9 @@ class HighQualityGenerator(nn.Module):
         ])
         
         # ========== PREDICTION DECODER ==========
-        # Pour prédire la frame suivante
         self.prediction_decoder = nn.ModuleList([
-            # Même architecture que reconstruction_decoder
             nn.Sequential(
-                nn.ConvTranspose2d(512, 256, 4, 2, 1),
+                nn.ConvTranspose2d(config.ENCODER_DIM, 256, 4, 2, 1),
                 nn.BatchNorm2d(256),
                 nn.ReLU(),
                 ResidualBlock(256),
@@ -245,11 +241,11 @@ class HighQualityGenerator(nn.Module):
         # Premier décodage sans skip
         x = self.reconstruction_decoder[0](x)
         
-        # Décodages suivants avec skip connections
+        # Décodages suivants avec skip connections (en ordre inverse)
         for i in range(1, len(self.reconstruction_decoder)):
-            if i < len(skip_connections):
-                # Ajouter la skip connection
-                skip = skip_connections[-(i+1)]
+            skip_idx = -(i+1)  # Indices négatifs pour partir de la fin
+            if abs(skip_idx) <= len(skip_connections):
+                skip = skip_connections[skip_idx]
                 x = torch.cat([x, skip], dim=1)
             x = self.reconstruction_decoder[i](x)
         
@@ -284,34 +280,39 @@ class HighQualityGenerator(nn.Module):
                 reconstructions.append(reconstruction)
         
         # ========== PHASE 2: TEMPORAL PROCESSING ==========
-        # Flatten et process temporel
+        # Flatten pour le LSTM
         flattened_features = []
         for feat in encoded_features:
+            # feat shape: [batch_size, ENCODER_DIM, LATENT_DIM, LATENT_DIM]
             flattened = feat.view(batch_size, -1)
             flattened_features.append(flattened)
         
         temporal_input = torch.stack(flattened_features, dim=1)
         temporal_output, _ = self.temporal_module(temporal_input)
         
-        # Prendre la dernière sortie temporelle
-        last_temporal = temporal_output[:, -1]
-        last_temporal = last_temporal.view(batch_size, 512, 16, 16)
+        # Prendre la dernière sortie temporelle et reshape
+        last_temporal = temporal_output[:, -1]  # [batch_size, temporal_hidden_size]
+        
+        # Reshape pour avoir la forme spatiale correcte
+        last_temporal = last_temporal.view(
+            batch_size, 
+            self.config.ENCODER_DIM, 
+            self.config.LATENT_DIM, 
+            self.config.LATENT_DIM
+        )
         
         # ========== PHASE 3: PREDICTION ==========
-        # Prédire la frame suivante
         predicted_frame = self.decode_prediction(last_temporal)
         
         # ========== PHASE 4: QUALITY REFINEMENT ==========
-        # Raffiner la prédiction
         refined_prediction = self.quality_refiner(predicted_frame)
         
         # ========== PHASE 5: DETAIL ENHANCEMENT ==========
-        # Combiner avec la dernière frame pour améliorer les détails
         last_input_frame = x[:, -1]
         combined = torch.cat([refined_prediction, last_input_frame], dim=1)
         final_prediction = self.detail_enhancer(combined)
         
-        # Fusion finale avec résiduel
+        # Fusion finale
         final_prediction = 0.7 * refined_prediction + 0.3 * final_prediction
         
         if return_all:
@@ -324,7 +325,7 @@ class MultiScaleDiscriminator(nn.Module):
     def __init__(self):
         super().__init__()
         
-        # Discriminateur pour détails fins (haute résolution)
+        # Discriminateur pour détails fins
         self.fine_discriminator = nn.Sequential(
             nn.Conv2d(6, 64, 4, 2, 1),
             nn.LeakyReLU(0.2),
@@ -340,9 +341,9 @@ class MultiScaleDiscriminator(nn.Module):
             nn.Conv2d(512, 1, 4, 1, 1)
         )
         
-        # Discriminateur pour structure globale (basse résolution)
+        # Discriminateur pour structure globale
         self.coarse_discriminator = nn.Sequential(
-            nn.AvgPool2d(2),  # Downsample
+            nn.AvgPool2d(2),
             nn.Conv2d(6, 32, 4, 2, 1),
             nn.LeakyReLU(0.2),
             nn.Conv2d(32, 64, 4, 2, 1),
@@ -365,48 +366,37 @@ class MultiScaleDiscriminator(nn.Module):
         
         return [fine_output, coarse_output]
 
-# ==================== Loss Functions Avancées ====================
+# ==================== Loss Functions ====================
 class EdgeLoss(nn.Module):
     """Loss pour préserver les contours nets"""
     def __init__(self):
         super().__init__()
-        # Sobel filters
-        self.sobel_x = nn.Conv2d(1, 1, 3, padding=1, bias=False)
-        self.sobel_y = nn.Conv2d(1, 1, 3, padding=1, bias=False)
+        sobel_x = torch.tensor([[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]], dtype=torch.float32)
+        sobel_y = torch.tensor([[-1, -2, -1], [0, 0, 0], [1, 2, 1]], dtype=torch.float32)
         
-        sobel_x_kernel = torch.tensor([[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]], dtype=torch.float32).view(1, 1, 3, 3)
-        sobel_y_kernel = torch.tensor([[-1, -2, -1], [0, 0, 0], [1, 2, 1]], dtype=torch.float32).view(1, 1, 3, 3)
-        
-        self.sobel_x.weight = nn.Parameter(sobel_x_kernel, requires_grad=False)
-        self.sobel_y.weight = nn.Parameter(sobel_y_kernel, requires_grad=False)
+        self.sobel_x = sobel_x.view(1, 1, 3, 3).repeat(3, 1, 1, 1)
+        self.sobel_y = sobel_y.view(1, 1, 3, 3).repeat(3, 1, 1, 1)
     
     def forward(self, pred, target):
-        # Convert to grayscale
-        pred_gray = 0.299 * pred[:, 0:1] + 0.587 * pred[:, 1:2] + 0.114 * pred[:, 2:3]
-        target_gray = 0.299 * target[:, 0:1] + 0.587 * target[:, 1:2] + 0.114 * target[:, 2:3]
+        self.sobel_x = self.sobel_x.to(pred.device)
+        self.sobel_y = self.sobel_y.to(pred.device)
         
-        # Compute edges
-        pred_edge_x = self.sobel_x(pred_gray)
-        pred_edge_y = self.sobel_y(pred_gray)
-        pred_edges = torch.sqrt(pred_edge_x**2 + pred_edge_y**2)
+        pred_edge_x = F.conv2d(pred, self.sobel_x, padding=1, groups=3)
+        pred_edge_y = F.conv2d(pred, self.sobel_y, padding=1, groups=3)
+        pred_edges = torch.sqrt(pred_edge_x**2 + pred_edge_y**2 + 1e-6)
         
-        target_edge_x = self.sobel_x(target_gray)
-        target_edge_y = self.sobel_y(target_gray)
-        target_edges = torch.sqrt(target_edge_x**2 + target_edge_y**2)
+        target_edge_x = F.conv2d(target, self.sobel_x, padding=1, groups=3)
+        target_edge_y = F.conv2d(target, self.sobel_y, padding=1, groups=3)
+        target_edges = torch.sqrt(target_edge_x**2 + target_edge_y**2 + 1e-6)
         
         return F.l1_loss(pred_edges, target_edges)
 
 class TextureLoss(nn.Module):
-    """Loss pour préserver les textures et détails fins"""
+    """Loss pour préserver les textures"""
     def __init__(self, device):
         super().__init__()
-        # Utiliser VGG pour extraire les features de texture
-        vgg = models.vgg19(pretrained=True).features
-        self.layers = nn.ModuleList([
-            vgg[:4],   # Conv1_2
-            vgg[4:9],  # Conv2_2
-            vgg[9:14]  # Conv3_2
-        ]).to(device).eval()
+        vgg = models.vgg19(pretrained=True).features[:10].to(device).eval()
+        self.features = vgg
         
         for p in self.parameters():
             p.requires_grad = False
@@ -418,9 +408,7 @@ class TextureLoss(nn.Module):
         return gram / (c * h * w)
     
     def forward(self, pred, target):
-        loss = 0
-        
-        # Normaliser pour VGG
+        # Normaliser
         mean = torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1).to(pred.device)
         std = torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1).to(pred.device)
         
@@ -429,69 +417,41 @@ class TextureLoss(nn.Module):
         pred = (pred - mean) / std
         target = (target - mean) / std
         
-        for layer in self.layers:
-            pred = layer(pred)
-            target = layer(target)
-            
-            pred_gram = self.gram_matrix(pred)
-            target_gram = self.gram_matrix(target)
-            
-            loss += F.l1_loss(pred_gram, target_gram)
+        pred_features = self.features(pred)
+        target_features = self.features(target)
         
-        return loss
+        pred_gram = self.gram_matrix(pred_features)
+        target_gram = self.gram_matrix(target_features)
+        
+        return F.l1_loss(pred_gram, target_gram)
 
 class SSIMLoss(nn.Module):
     """Structural Similarity Index Loss"""
-    def __init__(self, window_size=11, size_average=True):
+    def __init__(self):
         super().__init__()
-        self.window_size = window_size
-        self.size_average = size_average
-        self.channel = 3
-        self.window = self.create_window(window_size, self.channel)
     
-    def gaussian(self, window_size, sigma):
-        gauss = torch.Tensor([np.exp(-(x - window_size//2)**2/float(2*sigma**2)) for x in range(window_size)])
-        return gauss/gauss.sum()
-    
-    def create_window(self, window_size, channel):
-        _1D_window = self.gaussian(window_size, 1.5).unsqueeze(1)
-        _2D_window = _1D_window.mm(_1D_window.t()).float().unsqueeze(0).unsqueeze(0)
-        window = _2D_window.expand(channel, 1, window_size, window_size).contiguous()
-        return window
-    
-    def forward(self, img1, img2):
-        channel = img1.size()[1]
-        
-        if channel == self.channel and self.window.data.type() == img1.data.type():
-            window = self.window
-        else:
-            window = self.create_window(self.window_size, channel)
-            window = window.type_as(img1)
-            self.window = window
-            self.channel = channel
-        
-        mu1 = F.conv2d(img1, window, padding=self.window_size//2, groups=channel)
-        mu2 = F.conv2d(img2, window, padding=self.window_size//2, groups=channel)
+    def forward(self, pred, target):
+        # Simple SSIM approximation
+        mu1 = F.avg_pool2d(pred, 3, 1, 1)
+        mu2 = F.avg_pool2d(target, 3, 1, 1)
         
         mu1_sq = mu1.pow(2)
         mu2_sq = mu2.pow(2)
         mu1_mu2 = mu1 * mu2
         
-        sigma1_sq = F.conv2d(img1*img1, window, padding=self.window_size//2, groups=channel) - mu1_sq
-        sigma2_sq = F.conv2d(img2*img2, window, padding=self.window_size//2, groups=channel) - mu2_sq
-        sigma12 = F.conv2d(img1*img2, window, padding=self.window_size//2, groups=channel) - mu1_mu2
+        sigma1_sq = F.avg_pool2d(pred * pred, 3, 1, 1) - mu1_sq
+        sigma2_sq = F.avg_pool2d(target * target, 3, 1, 1) - mu2_sq
+        sigma12 = F.avg_pool2d(pred * target, 3, 1, 1) - mu1_mu2
         
-        C1 = 0.01**2
-        C2 = 0.03**2
+        C1 = 0.01 ** 2
+        C2 = 0.03 ** 2
         
-        ssim_map = ((2*mu1_mu2 + C1)*(2*sigma12 + C2))/((mu1_sq + mu2_sq + C1)*(sigma1_sq + sigma2_sq + C2))
+        ssim_map = ((2 * mu1_mu2 + C1) * (2 * sigma12 + C2)) / \
+                   ((mu1_sq + mu2_sq + C1) * (sigma1_sq + sigma2_sq + C2))
         
-        if self.size_average:
-            return 1 - ssim_map.mean()
-        else:
-            return 1 - ssim_map.mean(1).mean(1).mean(1)
+        return 1 - ssim_map.mean()
 
-# ==================== Trainer Haute Qualité ====================
+# ==================== Trainer ====================
 class HighQualityTrainer:
     def __init__(self, generator, discriminator, config):
         self.generator = generator.to(config.DEVICE)
@@ -518,8 +478,11 @@ class HighQualityTrainer:
         self.criterion_L2 = nn.MSELoss()
         
         # Advanced losses
-        from torchvision.models import vgg19
-        self.perceptual_loss = self.setup_perceptual_loss()
+        vgg = models.vgg19(pretrained=True).features[:23].to(config.DEVICE).eval()
+        for p in vgg.parameters():
+            p.requires_grad = False
+        self.perceptual_loss = vgg
+        
         self.edge_loss = EdgeLoss()
         self.texture_loss = TextureLoss(config.DEVICE)
         self.ssim_loss = SSIMLoss()
@@ -532,24 +495,14 @@ class HighQualityTrainer:
         self.metrics = {
             'g_losses': [],
             'd_losses': [],
-            'reconstruction_losses': [],
-            'prediction_losses': [],
-            'quality_scores': []
+            'reconstruction_losses': []
         }
         
         os.makedirs(config.CHECKPOINT_DIR, exist_ok=True)
         os.makedirs(config.OUTPUT_DIR, exist_ok=True)
     
-    def setup_perceptual_loss(self):
-        """Setup VGG perceptual loss"""
-        vgg = models.vgg19(pretrained=True).features[:23].to(self.config.DEVICE).eval()
-        for p in vgg.parameters():
-            p.requires_grad = False
-        return vgg
-    
     def compute_perceptual_loss(self, pred, target):
-        """Compute perceptual loss using VGG features"""
-        # Normalize
+        """Compute perceptual loss"""
         mean = torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1).to(pred.device)
         std = torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1).to(pred.device)
         
@@ -566,12 +519,12 @@ class HighQualityTrainer:
     def train_discriminator(self, real_batch, input_frames):
         self.optimizer_D.zero_grad()
         
-        with autocast():
+        with autocast(device_type='cuda', enabled=self.config.USE_MIXED_PRECISION):
             # Generate fake
             with torch.no_grad():
                 fake_batch, _ = self.generator(input_frames, return_all=True)
             
-            # Get multi-scale outputs
+            # Multi-scale outputs
             real_outputs = self.discriminator(input_frames, real_batch)
             fake_outputs = self.discriminator(input_frames, fake_batch)
             
@@ -594,22 +547,18 @@ class HighQualityTrainer:
     def train_generator(self, input_frames, target_frame):
         self.optimizer_G.zero_grad()
         
-        with autocast():
+        with autocast(device_type='cuda', enabled=self.config.USE_MIXED_PRECISION):
             # Generate with reconstructions
             predicted_frame, reconstructions = self.generator(input_frames, return_all=True)
             
             # ========== RECONSTRUCTION LOSS ==========
-            # Comparer les reconstructions avec les frames originales
             reconstruction_loss = 0
             for t in range(len(reconstructions)):
                 original_frame = input_frames[:, t]
                 reconstructed_frame = reconstructions[t]
                 
-                # L1 + L2 pour reconstruction parfaite
                 reconstruction_loss += self.criterion_L1(reconstructed_frame, original_frame)
                 reconstruction_loss += 0.5 * self.criterion_L2(reconstructed_frame, original_frame)
-                
-                # SSIM pour la structure
                 reconstruction_loss += self.config.SSIM_WEIGHT * self.ssim_loss(
                     reconstructed_frame, original_frame
                 )
@@ -617,19 +566,10 @@ class HighQualityTrainer:
             reconstruction_loss = reconstruction_loss / len(reconstructions)
             
             # ========== PREDICTION LOSSES ==========
-            # L1 Loss
             l1_loss = self.criterion_L1(predicted_frame, target_frame)
-            
-            # Perceptual Loss
             perceptual_loss = self.compute_perceptual_loss(predicted_frame, target_frame)
-            
-            # Edge Loss (pour les contours nets)
             edge_loss = self.edge_loss(predicted_frame, target_frame)
-            
-            # Texture Loss (pour les détails)
             texture_loss = self.texture_loss(predicted_frame, target_frame)
-            
-            # SSIM Loss
             ssim_loss = self.ssim_loss(predicted_frame, target_frame)
             
             # ========== GAN LOSS ==========
@@ -698,12 +638,10 @@ class HighQualityTrainer:
                 pbar.set_postfix({
                     'G': f"{g_losses['total']:.3f}",
                     'Recon': f"{g_losses['reconstruction']:.3f}",
-                    'L1': f"{g_losses['l1']:.3f}",
-                    'Edge': f"{g_losses['edge']:.3f}",
-                    'SSIM': f"{g_losses['ssim']:.3f}"
+                    'L1': f"{g_losses['l1']:.3f}"
                 })
                 
-                # Clear memory periodically
+                # Clear memory
                 if batch_idx % 10 == 0:
                     torch.cuda.empty_cache()
         
@@ -721,10 +659,9 @@ class HighQualityTrainer:
             input_frames = data[0][:1].to(self.config.DEVICE)
             target_frame = data[1][:1].to(self.config.DEVICE)
             
-            with autocast():
+            with autocast(device_type='cuda', enabled=self.config.USE_MIXED_PRECISION):
                 predicted_frame, reconstructions = self.generator(input_frames, return_all=True)
             
-            # Helper function
             def tensor_to_image(tensor):
                 img = tensor[0].cpu().numpy()
                 img = (img + 1) / 2
@@ -732,78 +669,24 @@ class HighQualityTrainer:
                 img = np.clip(img * 255, 0, 255).astype(np.uint8)
                 return cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
             
-            # Create comparison grid
+            # Create grid
             images = []
-            
-            # Original input
-            input_img = tensor_to_image(input_frames[:, -1])
-            images.append(input_img)
-            
-            # Reconstruction of input
+            images.append(tensor_to_image(input_frames[:, -1]))  # Input
             if reconstructions:
-                recon_img = tensor_to_image(reconstructions[-1])
-                images.append(recon_img)
+                images.append(tensor_to_image(reconstructions[-1]))  # Reconstruction
+            images.append(tensor_to_image(target_frame))  # Target
+            images.append(tensor_to_image(predicted_frame))  # Prediction
             
-            # Target
-            target_img = tensor_to_image(target_frame)
-            images.append(target_img)
-            
-            # Prediction
-            pred_img = tensor_to_image(predicted_frame)
-            images.append(pred_img)
-            
-            # Stack images
-            top_row = np.hstack(images[:2]) if len(images) > 2 else images[0]
-            bottom_row = np.hstack(images[2:]) if len(images) > 2 else images[1]
+            # Create 2x2 grid
+            top_row = np.hstack(images[:2])
+            bottom_row = np.hstack(images[2:])
             grid = np.vstack([top_row, bottom_row])
-            
-            # Add labels
-            font = cv2.FONT_HERSHEY_SIMPLEX
-            cv2.putText(grid, "Input", (10, 30), font, 1, (255, 255, 255), 2)
-            cv2.putText(grid, "Reconstruction", (266, 30), font, 1, (255, 255, 255), 2)
-            cv2.putText(grid, "Target", (10, 286), font, 1, (255, 255, 255), 2)
-            cv2.putText(grid, "Prediction", (266, 286), font, 1, (255, 255, 255), 2)
             
             save_path = os.path.join(self.config.OUTPUT_DIR, f'epoch_{epoch+1}.png')
             cv2.imwrite(save_path, grid)
-            print(f"📸 Visualisation: {save_path}")
+            print(f"📸 Saved: {save_path}")
             
-            # Clear memory
             torch.cuda.empty_cache()
-    
-    def train(self, train_loader, val_loader=None):
-        print(f"🚀 High Quality Training on {self.config.DEVICE}")
-        print(f"📊 Focus on: Reconstruction + Prediction Quality")
-        
-        best_val_loss = float('inf')
-        
-        for epoch in range(self.config.NUM_EPOCHS):
-            print(f"\n{'='*60}")
-            print(f"📅 Epoch {epoch+1}/{self.config.NUM_EPOCHS}")
-            
-            # Training
-            g_loss, d_loss, recon_loss = self.train_epoch(train_loader, epoch)
-            
-            self.metrics['g_losses'].append(g_loss)
-            self.metrics['d_losses'].append(d_loss)
-            self.metrics['reconstruction_losses'].append(recon_loss)
-            
-            print(f"📊 Generator Loss: {g_loss:.4f}")
-            print(f"📊 Discriminator Loss: {d_loss:.4f}")
-            print(f"📊 Reconstruction Loss: {recon_loss:.4f}")
-            
-            # Visualize
-            if (epoch + 1) % 5 == 0:
-                self.visualize_results(train_loader, epoch)
-            
-            # Save checkpoint
-            if (epoch + 1) % 20 == 0:
-                self.save_checkpoint(epoch, g_loss, d_loss)
-            
-            # Save metrics
-            if (epoch + 1) % 10 == 0:
-                with open(os.path.join(self.config.OUTPUT_DIR, 'metrics.json'), 'w') as f:
-                    json.dump(self.metrics, f, indent=2)
     
     def save_checkpoint(self, epoch, g_loss, d_loss):
         checkpoint = {
@@ -816,10 +699,31 @@ class HighQualityTrainer:
         
         path = os.path.join(
             self.config.CHECKPOINT_DIR,
-            f'checkpoint_epoch_{epoch}_quality.pth'
+            f'checkpoint_epoch_{epoch}.pth'
         )
         torch.save(checkpoint, path)
-        print(f"✅ Checkpoint saved: {path}")
+        print(f"✅ Checkpoint: {path}")
+    
+    def train(self, train_loader, val_loader=None):
+        print(f"🚀 High Quality Training on {self.config.DEVICE}")
+        
+        for epoch in range(self.config.NUM_EPOCHS):
+            print(f"\n{'='*60}")
+            print(f"📅 Epoch {epoch+1}/{self.config.NUM_EPOCHS}")
+            
+            g_loss, d_loss, recon_loss = self.train_epoch(train_loader, epoch)
+            
+            self.metrics['g_losses'].append(g_loss)
+            self.metrics['d_losses'].append(d_loss)
+            self.metrics['reconstruction_losses'].append(recon_loss)
+            
+            print(f"📊 G Loss: {g_loss:.4f} | D Loss: {d_loss:.4f} | Recon: {recon_loss:.4f}")
+            
+            if (epoch + 1) % 5 == 0:
+                self.visualize_results(train_loader, epoch)
+            
+            if (epoch + 1) % 20 == 0:
+                self.save_checkpoint(epoch, g_loss, d_loss)
 
 # ==================== Dataset ====================
 class QualityAnimeDataset(Dataset):
@@ -856,12 +760,10 @@ class QualityAnimeDataset(Dataset):
 def main():
     config = Config()
     
-    # Set CUDA optimization
     os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True'
     torch.cuda.empty_cache()
     
     print("🎨 High Quality Anime Frame Prediction")
-    print("✨ Focus: Reconstruction Quality + Prediction Accuracy")
     print(f"📊 Device: {config.DEVICE}")
     
     # Dataset
@@ -872,7 +774,6 @@ def main():
         img_size=config.IMG_SIZE
     )
     
-    # DataLoader
     dataloader = DataLoader(
         dataset,
         batch_size=config.BATCH_SIZE,
@@ -887,12 +788,6 @@ def main():
     print("\n🤖 Creating models...")
     generator = HighQualityGenerator(config)
     discriminator = MultiScaleDiscriminator()
-    
-    # Count parameters
-    g_params = sum(p.numel() for p in generator.parameters())
-    d_params = sum(p.numel() for p in discriminator.parameters())
-    print(f"📊 Generator: {g_params:,} parameters")
-    print(f"📊 Discriminator: {d_params:,} parameters")
     
     # Trainer
     trainer = HighQualityTrainer(generator, discriminator, config)

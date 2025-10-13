@@ -10,6 +10,7 @@ import matplotlib.pyplot as plt
 from tqdm import tqdm
 import json
 from typing import List, Tuple
+import traceback
 
 # ==================== 1. DATASET POUR VOS IMAGES ====================
 class VideoSequenceDataset(Dataset):
@@ -55,7 +56,7 @@ class VideoSequenceDataset(Dataset):
         self.stride = stride
         
         if extensions is None:
-            self.extensions = ['.png', '.jpg', '.jpeg', '.bmp', '.tiff']
+            self.extensions = ['.png', '.jpg', '.jpeg', '.bmp', '.tiff', '.PNG', '.JPG', '.JPEG']
         else:
             self.extensions = extensions
         
@@ -153,7 +154,7 @@ def analyze_dataset(data_dir):
         return False
     
     # Compter les fichiers images
-    extensions = ['.png', '.jpg', '.jpeg', '.bmp', '.tiff']
+    extensions = ['.png', '.jpg', '.jpeg', '.bmp', '.tiff', '.PNG', '.JPG', '.JPEG']
     all_images = []
     for ext in extensions:
         all_images.extend(list(data_dir.rglob(f"*{ext}")))
@@ -220,38 +221,95 @@ def visualize_dataset_samples(dataset, num_samples=3, save_path="dataset_preview
     plt.tight_layout()
     plt.savefig(save_path, dpi=150, bbox_inches='tight')
     print(f"✅ Aperçu sauvegardé: {save_path}")
-    plt.show()
+    plt.close()
 
 # ==================== 3. MODÈLE DE TOKENISATION ====================
 class ImageTokenizer(nn.Module):
-    """Encode les images en représentations latentes"""
-    def __init__(self, img_size=64, patch_size=8, embed_dim=256):
+    """Encode les images en représentations latentes - VERSION ADAPTATIVE"""
+    def __init__(self, img_size=64, embed_dim=256):
         super().__init__()
-        self.patch_size = patch_size
-        self.num_patches = (img_size // patch_size) ** 2
+        self.img_size = img_size
+        self.embed_dim = embed_dim
         
-        # Encoder : Image -> Embeddings
-        self.encoder = nn.Sequential(
-            nn.Conv2d(3, 64, 4, 2, 1),  # 64x64 -> 32x32
-            nn.ReLU(),
-            nn.Conv2d(64, 128, 4, 2, 1),  # 32x32 -> 16x16
-            nn.ReLU(),
-            nn.Conv2d(128, 256, 4, 2, 1),  # 16x16 -> 8x8
-            nn.ReLU(),
-            nn.Conv2d(256, embed_dim, 3, 1, 1),
-        )
+        # Calculer le nombre de downsampling nécessaires
+        # Pour arriver à une taille raisonnable (8x8 ou 16x16)
+        if img_size >= 256:
+            # Pour 256: 256 -> 128 -> 64 -> 32 -> 16
+            self.encoder = nn.Sequential(
+                nn.Conv2d(3, 64, 4, 2, 1),      # 256 -> 128
+                nn.ReLU(),
+                nn.Conv2d(64, 128, 4, 2, 1),    # 128 -> 64
+                nn.ReLU(),
+                nn.Conv2d(128, 256, 4, 2, 1),   # 64 -> 32
+                nn.ReLU(),
+                nn.Conv2d(256, 256, 4, 2, 1),   # 32 -> 16
+                nn.ReLU(),
+                nn.Conv2d(256, embed_dim, 3, 1, 1),  # 16 -> 16
+            )
+            
+            self.decoder = nn.Sequential(
+                nn.ConvTranspose2d(embed_dim, 256, 3, 1, 1),
+                nn.ReLU(),
+                nn.ConvTranspose2d(256, 256, 4, 2, 1),   # 16 -> 32
+                nn.ReLU(),
+                nn.ConvTranspose2d(256, 128, 4, 2, 1),   # 32 -> 64
+                nn.ReLU(),
+                nn.ConvTranspose2d(128, 64, 4, 2, 1),    # 64 -> 128
+                nn.ReLU(),
+                nn.ConvTranspose2d(64, 3, 4, 2, 1),      # 128 -> 256
+                nn.Sigmoid()
+            )
+            self.latent_size = 16
+            
+        elif img_size >= 128:
+            # Pour 128: 128 -> 64 -> 32 -> 16
+            self.encoder = nn.Sequential(
+                nn.Conv2d(3, 64, 4, 2, 1),      # 128 -> 64
+                nn.ReLU(),
+                nn.Conv2d(64, 128, 4, 2, 1),    # 64 -> 32
+                nn.ReLU(),
+                nn.Conv2d(128, 256, 4, 2, 1),   # 32 -> 16
+                nn.ReLU(),
+                nn.Conv2d(256, embed_dim, 3, 1, 1),  # 16 -> 16
+            )
+            
+            self.decoder = nn.Sequential(
+                nn.ConvTranspose2d(embed_dim, 256, 3, 1, 1),
+                nn.ReLU(),
+                nn.ConvTranspose2d(256, 128, 4, 2, 1),   # 16 -> 32
+                nn.ReLU(),
+                nn.ConvTranspose2d(128, 64, 4, 2, 1),    # 32 -> 64
+                nn.ReLU(),
+                nn.ConvTranspose2d(64, 3, 4, 2, 1),      # 64 -> 128
+                nn.Sigmoid()
+            )
+            self.latent_size = 16
+            
+        else:  # 64 ou moins
+            # Pour 64: 64 -> 32 -> 16 -> 8
+            self.encoder = nn.Sequential(
+                nn.Conv2d(3, 64, 4, 2, 1),      # 64 -> 32
+                nn.ReLU(),
+                nn.Conv2d(64, 128, 4, 2, 1),    # 32 -> 16
+                nn.ReLU(),
+                nn.Conv2d(128, 256, 4, 2, 1),   # 16 -> 8
+                nn.ReLU(),
+                nn.Conv2d(256, embed_dim, 3, 1, 1),  # 8 -> 8
+            )
+            
+            self.decoder = nn.Sequential(
+                nn.ConvTranspose2d(embed_dim, 256, 3, 1, 1),
+                nn.ReLU(),
+                nn.ConvTranspose2d(256, 128, 4, 2, 1),   # 8 -> 16
+                nn.ReLU(),
+                nn.ConvTranspose2d(128, 64, 4, 2, 1),    # 16 -> 32
+                nn.ReLU(),
+                nn.ConvTranspose2d(64, 3, 4, 2, 1),      # 32 -> 64
+                nn.Sigmoid()
+            )
+            self.latent_size = 8
         
-        # Decoder : Embeddings -> Image
-        self.decoder = nn.Sequential(
-            nn.ConvTranspose2d(embed_dim, 256, 3, 1, 1),
-            nn.ReLU(),
-            nn.ConvTranspose2d(256, 128, 4, 2, 1),  # 8x8 -> 16x16
-            nn.ReLU(),
-            nn.ConvTranspose2d(128, 64, 4, 2, 1),  # 16x16 -> 32x32
-            nn.ReLU(),
-            nn.ConvTranspose2d(64, 3, 4, 2, 1),  # 32x32 -> 64x64
-            nn.Sigmoid()
-        )
+        print(f"   🔍 Tokenizer: {img_size}x{img_size} -> {self.latent_size}x{self.latent_size} latent")
     
     def encode(self, x):
         return self.encoder(x)
@@ -279,29 +337,36 @@ class PositionalEncoding(nn.Module):
         return x + self.pe[:x.size(1), :].unsqueeze(0)
 
 class VideoGPT(nn.Module):
-    """Modèle type GPT pour prédire la prochaine image"""
+    """Modèle type GPT pour prédire la prochaine image - VERSION CORRIGÉE"""
     def __init__(self, embed_dim=256, num_heads=8, num_layers=6, img_size=64):
         super().__init__()
         self.embed_dim = embed_dim
+        self.img_size = img_size
         
         # Tokenizer d'images
         self.tokenizer = ImageTokenizer(img_size=img_size, embed_dim=embed_dim)
         
+        # Calculer la dimension après flattening
+        self.latent_size = self.tokenizer.latent_size
+        self.latent_dim = embed_dim * self.latent_size * self.latent_size
+        
+        print(f"   🔍 Latent dimension: {self.latent_dim} ({embed_dim} x {self.latent_size} x {self.latent_size})")
+        
         # Positional encoding
-        self.pos_encoder = PositionalEncoding(embed_dim * 64)
+        self.pos_encoder = PositionalEncoding(self.latent_dim)
         
         # Transformer Encoder
         encoder_layer = nn.TransformerEncoderLayer(
-            d_model=embed_dim * 64, 
+            d_model=self.latent_dim, 
             nhead=num_heads,
-            dim_feedforward=embed_dim * 128,
+            dim_feedforward=self.latent_dim * 2,
             batch_first=True,
             dropout=0.1
         )
         self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
         
         # Projection pour décoder
-        self.projection = nn.Linear(embed_dim * 64, embed_dim * 64)
+        self.projection = nn.Linear(self.latent_dim, self.latent_dim)
     
     def forward(self, input_frames):
         """
@@ -312,34 +377,49 @@ class VideoGPT(nn.Module):
         # Encoder chaque frame
         encoded_frames = []
         for i in range(num_frames):
-            _, z = self.tokenizer(input_frames[:, i])  # (B, embed_dim, 8, 8)
-            z = z.flatten(1)  # (B, embed_dim * 64)
+            _, z = self.tokenizer(input_frames[:, i])  # (B, embed_dim, latent_size, latent_size)
+            z = z.flatten(1)  # (B, latent_dim)
             encoded_frames.append(z)
         
         # Stack les frames encodés
-        encoded_seq = torch.stack(encoded_frames, dim=1)  # (B, num_frames, embed_dim*64)
+        encoded_seq = torch.stack(encoded_frames, dim=1)  # (B, num_frames, latent_dim)
         
         # Positional encoding
         encoded_seq = self.pos_encoder(encoded_seq)
         
         # Transformer
-        transformed = self.transformer(encoded_seq)  # (B, num_frames, embed_dim*64)
+        transformed = self.transformer(encoded_seq)  # (B, num_frames, latent_dim)
         
         # Prendre la dernière sortie pour prédire la prochaine frame
-        next_frame_encoding = self.projection(transformed[:, -1])  # (B, embed_dim*64)
+        next_frame_encoding = self.projection(transformed[:, -1])  # (B, latent_dim)
         
         # Reshape et décoder
-        next_frame_encoding = next_frame_encoding.view(batch_size, self.embed_dim, 8, 8)
+        next_frame_encoding = next_frame_encoding.view(
+            batch_size, self.embed_dim, self.latent_size, self.latent_size
+        )
         predicted_frame = self.tokenizer.decode(next_frame_encoding)
         
         return predicted_frame
 
-# ==================== 5. ENTRAÎNEMENT ====================
-def train_model(model, train_loader, val_loader=None, num_epochs=50, lr=1e-4, device='cuda', save_dir="checkpoints"):
-    """Entraîne le modèle"""
+# ==================== 5. ENTRAÎNEMENT AVEC VISUALISATION ====================
+def train_model(model, train_loader, val_loader=None, num_epochs=50, lr=1e-4, 
+                device='cuda', save_dir="checkpoints", visualize_every=5):
+    """Entraîne le modèle avec sauvegarde d'images à chaque epoch"""
     os.makedirs(save_dir, exist_ok=True)
+    os.makedirs(os.path.join(save_dir, "predictions"), exist_ok=True)
     
-    model = model.to(device)
+    print(f"\n🔍 DEBUG - Préparation de l'entraînement...")
+    print(f"   Device: {device}")
+    print(f"   Nombre d'epochs: {num_epochs}")
+    print(f"   Learning rate: {lr}")
+    
+    try:
+        model = model.to(device)
+        print(f"   ✅ Modèle transféré sur {device}")
+    except Exception as e:
+        print(f"   ❌ Erreur lors du transfert sur {device}: {e}")
+        raise
+    
     optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=0.01)
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=5)
     criterion = nn.MSELoss()
@@ -347,48 +427,76 @@ def train_model(model, train_loader, val_loader=None, num_epochs=50, lr=1e-4, de
     history = {'train_loss': [], 'val_loss': []}
     best_val_loss = float('inf')
     
+    print(f"\n🚀 Démarrage de l'entraînement...\n")
+    
     for epoch in range(num_epochs):
+        print(f"\n{'='*60}")
+        print(f"📅 EPOCH {epoch+1}/{num_epochs}")
+        print(f"{'='*60}")
+        
         # ===== ENTRAÎNEMENT =====
         model.train()
         epoch_loss = 0
+        batch_count = 0
         
-        pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{num_epochs}")
-        for input_frames, target_frame in pbar:
-            input_frames = input_frames.to(device)
-            target_frame = target_frame.to(device)
+        try:
+            pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{num_epochs} [TRAIN]")
+            for batch_idx, (input_frames, target_frame) in enumerate(pbar):
+                try:
+                    input_frames = input_frames.to(device)
+                    target_frame = target_frame.to(device)
+                    
+                    # Forward pass
+                    predicted_frame = model(input_frames)
+                    loss = criterion(predicted_frame, target_frame)
+                    
+                    # Backward pass
+                    optimizer.zero_grad()
+                    loss.backward()
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                    optimizer.step()
+                    
+                    epoch_loss += loss.item()
+                    batch_count += 1
+                    pbar.set_postfix({'loss': f'{loss.item():.6f}'})
+                    
+                except Exception as e:
+                    print(f"\n❌ Erreur au batch {batch_idx}: {e}")
+                    print(f"   Input shape: {input_frames.shape}")
+                    print(f"   Target shape: {target_frame.shape}")
+                    traceback.print_exc()
+                    raise
             
-            # Forward pass
-            predicted_frame = model(input_frames)
-            loss = criterion(predicted_frame, target_frame)
+            avg_train_loss = epoch_loss / batch_count if batch_count > 0 else 0
+            history['train_loss'].append(avg_train_loss)
+            print(f"✅ Train Loss: {avg_train_loss:.6f}")
             
-            # Backward pass
-            optimizer.zero_grad()
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            optimizer.step()
-            
-            epoch_loss += loss.item()
-            pbar.set_postfix({'loss': loss.item()})
-        
-        avg_train_loss = epoch_loss / len(train_loader)
-        history['train_loss'].append(avg_train_loss)
+        except Exception as e:
+            print(f"\n❌ Erreur pendant l'entraînement à l'epoch {epoch+1}: {e}")
+            traceback.print_exc()
+            raise
         
         # ===== VALIDATION =====
         if val_loader is not None:
             model.eval()
             val_loss = 0
+            val_batch_count = 0
+            
             with torch.no_grad():
-                for input_frames, target_frame in val_loader:
+                pbar_val = tqdm(val_loader, desc=f"Epoch {epoch+1}/{num_epochs} [VAL]")
+                for input_frames, target_frame in pbar_val:
                     input_frames = input_frames.to(device)
                     target_frame = target_frame.to(device)
                     predicted_frame = model(input_frames)
                     val_loss += criterion(predicted_frame, target_frame).item()
+                    val_batch_count += 1
+                    pbar_val.set_postfix({'val_loss': f'{val_loss/val_batch_count:.6f}'})
             
-            avg_val_loss = val_loss / len(val_loader)
+            avg_val_loss = val_loss / val_batch_count if val_batch_count > 0 else 0
             history['val_loss'].append(avg_val_loss)
             scheduler.step(avg_val_loss)
             
-            print(f"Epoch {epoch+1}/{num_epochs} - Train Loss: {avg_train_loss:.6f} - Val Loss: {avg_val_loss:.6f}")
+            print(f"✅ Val Loss: {avg_val_loss:.6f}")
             
             # Sauvegarder le meilleur modèle
             if avg_val_loss < best_val_loss:
@@ -399,18 +507,70 @@ def train_model(model, train_loader, val_loader=None, num_epochs=50, lr=1e-4, de
                     'optimizer_state_dict': optimizer.state_dict(),
                     'loss': avg_val_loss,
                 }, os.path.join(save_dir, 'best_model.pth'))
-                print(f"   ✅ Meilleur modèle sauvegardé (val_loss: {avg_val_loss:.6f})")
-        else:
-            print(f"Epoch {epoch+1}/{num_epochs} - Train Loss: {avg_train_loss:.6f}")
+                print(f"   💾 Meilleur modèle sauvegardé (val_loss: {avg_val_loss:.6f})")
+        
+        # ===== VISUALISATION =====
+        if (epoch + 1) % visualize_every == 0 or epoch == 0:
+            print(f"🖼️  Génération de visualisations...")
+            try:
+                model.eval()
+                with torch.no_grad():
+                    # Prendre un échantillon aléatoire
+                    sample_input, sample_target = next(iter(val_loader if val_loader else train_loader))
+                    sample_input = sample_input[:4].to(device)  # Prendre 4 exemples
+                    sample_target = sample_target[:4].to(device)
+                    sample_pred = model(sample_input)
+                    
+                    # Créer la visualisation
+                    fig, axes = plt.subplots(4, sample_input.shape[1] + 2, figsize=(3*(sample_input.shape[1]+2), 12))
+                    
+                    for i in range(4):
+                        # Frames d'entrée
+                        for j in range(sample_input.shape[1]):
+                            img = sample_input[i, j].cpu().permute(1, 2, 0).numpy()
+                            axes[i, j].imshow(img)
+                            axes[i, j].set_title(f"Input {j+1}")
+                            axes[i, j].axis('off')
+                        
+                        # Target
+                        img_target = sample_target[i].cpu().permute(1, 2, 0).numpy()
+                        axes[i, sample_input.shape[1]].imshow(img_target)
+                        axes[i, sample_input.shape[1]].set_title("Target")
+                        axes[i, sample_input.shape[1]].axis('off')
+                        axes[i, sample_input.shape[1]].set_facecolor('#e8f4ea')
+                        
+                        # Prédiction
+                        img_pred = sample_pred[i].cpu().permute(1, 2, 0).numpy()
+                        axes[i, sample_input.shape[1] + 1].imshow(img_pred)
+                        axes[i, sample_input.shape[1] + 1].set_title("Predicted")
+                        axes[i, sample_input.shape[1] + 1].axis('off')
+                        axes[i, sample_input.shape[1] + 1].set_facecolor('#fff4e6')
+                    
+                    plt.suptitle(f'Epoch {epoch+1} - Train Loss: {avg_train_loss:.6f}', fontsize=16)
+                    plt.tight_layout()
+                    
+                    save_path = os.path.join(save_dir, "predictions", f"epoch_{epoch+1:03d}.png")
+                    plt.savefig(save_path, dpi=100, bbox_inches='tight')
+                    plt.close()
+                    print(f"   ✅ Visualisation sauvegardée: {save_path}")
+                    
+            except Exception as e:
+                print(f"   ⚠️  Erreur lors de la visualisation: {e}")
         
         # Sauvegarder checkpoint régulier
         if (epoch + 1) % 10 == 0:
+            checkpoint_path = os.path.join(save_dir, f'checkpoint_epoch_{epoch+1}.pth')
             torch.save({
                 'epoch': epoch,
                 'model_state_dict': model.state_dict(),
                 'optimizer_state_dict': optimizer.state_dict(),
                 'loss': avg_train_loss,
-            }, os.path.join(save_dir, f'checkpoint_epoch_{epoch+1}.pth'))
+            }, checkpoint_path)
+            print(f"   💾 Checkpoint sauvegardé: {checkpoint_path}")
+    
+    print(f"\n{'='*60}")
+    print("✅ ENTRAÎNEMENT TERMINÉ!")
+    print(f"{'='*60}\n")
     
     return history
 
@@ -491,7 +651,7 @@ def visualize_sequence_prediction(initial_frames, predictions, save_path="sequen
     plt.tight_layout()
     plt.savefig(save_path, dpi=150, bbox_inches='tight')
     print(f"✅ Séquence sauvegardée: {save_path}")
-    plt.show()
+    plt.close()
 
 # ==================== 8. FONCTION PRINCIPALE ====================
 def main():
@@ -501,9 +661,9 @@ def main():
     # 🔧 MODIFIEZ CES PARAMÈTRES SELON VOS BESOINS
     CONFIG = {
         'data_dir': '/kaggle/input/anima-s-dataset/test/',  # 📁 CHEMIN VERS VOS IMAGES
-        'img_size': 256,              # Taille des images (64, 128, 256...)
+        'img_size': 256,             # Taille des images (64, 128, 256...)
         'context_length': 2,         # Nombre d'images en entrée
-        'batch_size': 16,            # Taille des batchs
+        'batch_size': 8,             # Taille des batchs (réduit pour img_size=256)
         'num_epochs': 50,            # Nombre d'époques
         'learning_rate': 1e-4,       # Taux d'apprentissage
         'val_split': 0.2,            # Proportion pour validation (0.2 = 20%)
@@ -511,6 +671,7 @@ def main():
         'embed_dim': 256,            # Dimension des embeddings
         'num_heads': 8,              # Nombre de têtes d'attention
         'num_layers': 4,             # Nombre de couches Transformer
+        'visualize_every': 5,        # Sauvegarder des images tous les N epochs
     }
     
     DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
@@ -523,131 +684,161 @@ def main():
     print(f"📊 Context: {CONFIG['context_length']} frames")
     print(f"{'='*60}\n")
     
-    # ========== 1. ANALYSER LE DATASET ==========
-    print("📊 ÉTAPE 1/6: Analyse du dataset")
-    print("-" * 60)
-    if not analyze_dataset(CONFIG['data_dir']):
-        print("\n❌ Veuillez corriger les problèmes ci-dessus avant de continuer.")
-        return
-    
-    # ========== 2. CHARGER LE DATASET ==========
-    print("\n📦 ÉTAPE 2/6: Chargement du dataset")
-    print("-" * 60)
     try:
+        # ========== 1. ANALYSER LE DATASET ==========
+        print("📊 ÉTAPE 1/6: Analyse du dataset")
+        print("-" * 60)
+        if not analyze_dataset(CONFIG['data_dir']):
+            print("\n❌ Veuillez corriger les problèmes ci-dessus avant de continuer.")
+            return
+        
+        # ========== 2. CHARGER LE DATASET ==========
+        print("\n📦 ÉTAPE 2/6: Chargement du dataset")
+        print("-" * 60)
+        
         full_dataset = VideoSequenceDataset(
             CONFIG['data_dir'],
             context_length=CONFIG['context_length'],
             img_size=CONFIG['img_size'],
             stride=CONFIG['stride']
         )
+        
+        # Split train/val
+        val_size = int(len(full_dataset) * CONFIG['val_split'])
+        train_size = len(full_dataset) - val_size
+        train_dataset, val_dataset = torch.utils.data.random_split(
+            full_dataset, [train_size, val_size]
+        )
+        
+        train_loader = DataLoader(
+            train_dataset, 
+            batch_size=CONFIG['batch_size'], 
+            shuffle=True, 
+            num_workers=0,
+            pin_memory=True if DEVICE == 'cuda' else False
+        )
+        val_loader = DataLoader(
+            val_dataset, 
+            batch_size=CONFIG['batch_size'], 
+            shuffle=False, 
+            num_workers=0,
+            pin_memory=True if DEVICE == 'cuda' else False
+        )
+        
+        print(f"✅ Dataset chargé:")
+        print(f"   - Total: {len(full_dataset)} échantillons")
+        print(f"   - Train: {train_size} échantillons")
+        print(f"   - Val: {val_size} échantillons")
+        print(f"   - Batch size: {CONFIG['batch_size']}")
+        print(f"   - Train batches: {len(train_loader)}")
+        print(f"   - Val batches: {len(val_loader)}")
+        
+        # ========== 3. VISUALISER DES ÉCHANTILLONS ==========
+        print("\n🖼️  ÉTAPE 3/6: Aperçu du dataset")
+        print("-" * 60)
+        visualize_dataset_samples(full_dataset, num_samples=3)
+        
+        # ========== 4. CRÉER LE MODÈLE ==========
+        print("\n🧠 ÉTAPE 4/6: Création du modèle")
+        print("-" * 60)
+        
+        model = VideoGPT(
+            embed_dim=CONFIG['embed_dim'],
+            num_heads=CONFIG['num_heads'],
+            num_layers=CONFIG['num_layers'],
+            img_size=CONFIG['img_size']
+        )
+        
+        total_params = sum(p.numel() for p in model.parameters())
+        trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        print(f"✅ Modèle créé:")
+        print(f"   - Paramètres totaux: {total_params:,}")
+        print(f"   - Paramètres entraînables: {trainable_params:,}")
+        print(f"   - Taille estimée: {total_params * 4 / 1024 / 1024:.2f} MB")
+        
+        # Test forward pass
+        print(f"\n🔍 Test du modèle...")
+        test_input, test_target = next(iter(train_loader))
+        print(f"   - Input shape: {test_input.shape}")
+        print(f"   - Target shape: {test_target.shape}")
+        
+        model_test = model.to(DEVICE)
+        test_input_device = test_input.to(DEVICE)
+        with torch.no_grad():
+            test_output = model_test(test_input_device)
+        print(f"   - Output shape: {test_output.shape}")
+        print(f"   ✅ Forward pass réussi!")
+        
+        # ========== 5. ENTRAÎNER ==========
+        print("\n🏋️  ÉTAPE 5/6: Entraînement")
+        print("-" * 60)
+        
+        history = train_model(
+            model,
+            train_loader,
+            val_loader,
+            num_epochs=CONFIG['num_epochs'],
+            lr=CONFIG['learning_rate'],
+            device=DEVICE,
+            visualize_every=CONFIG['visualize_every']
+        )
+        
+        # Sauvegarder le modèle final
+        torch.save(model.state_dict(), 'video_gpt_final.pth')
+        print("\n✅ Modèle final sauvegardé: video_gpt_final.pth")
+        
+        # Courbe d'apprentissage
+        plt.figure(figsize=(10, 5))
+        plt.plot(history['train_loss'], label='Train Loss', marker='o')
+        if history['val_loss']:
+            plt.plot(history['val_loss'], label='Validation Loss', marker='s')
+        plt.xlabel('Epoch')
+        plt.ylabel('Loss (MSE)')
+        plt.title('Courbe d\'apprentissage')
+        plt.legend()
+        plt.grid(True, alpha=0.3)
+        plt.savefig('training_curve.png', dpi=150, bbox_inches='tight')
+        print("✅ Courbe d'apprentissage sauvegardée: training_curve.png")
+        plt.close()
+        
+        # ========== 6. TESTER ==========
+        print("\n🎯 ÉTAPE 6/6: Test de prédiction")
+        print("-" * 60)
+        
+        # Test 1: Prédiction simple
+        input_frames, target_frame = full_dataset[0]
+        predicted_frame = predict_next_frame(model, input_frames, device=DEVICE)
+        visualize_prediction(input_frames, target_frame, predicted_frame, "test_prediction.png")
+        print("✅ Prédiction simple sauvegardée: test_prediction.png")
+        
+        # Test 2: Prédiction de séquence
+        predictions = predict_sequence(model, input_frames, num_predictions=5, device=DEVICE)
+        visualize_sequence_prediction(input_frames, predictions, "test_sequence.png")
+        
+        print("\n" + "="*60)
+        print("✅ ENTRAÎNEMENT TERMINÉ AVEC SUCCÈS!")
+        print("="*60)
+        print("\n📁 Fichiers générés:")
+        print("   - video_gpt_final.pth (modèle final)")
+        print("   - checkpoints/best_model.pth (meilleur modèle)")
+        print("   - checkpoints/predictions/epoch_*.png (prédictions par epoch)")
+        print("   - training_curve.png (courbe d'apprentissage)")
+        print("   - dataset_preview.png (aperçu du dataset)")
+        print("   - test_prediction.png (test de prédiction)")
+        print("   - test_sequence.png (test de séquence)")
+        print("\n" + "="*60)
+        
     except Exception as e:
-        print(f"\n❌ Erreur lors du chargement: {e}")
-        return
-    
-    # Split train/val
-    val_size = int(len(full_dataset) * CONFIG['val_split'])
-    train_size = len(full_dataset) - val_size
-    train_dataset, val_dataset = torch.utils.data.random_split(
-        full_dataset, [train_size, val_size]
-    )
-    
-    train_loader = DataLoader(
-        train_dataset, 
-        batch_size=CONFIG['batch_size'], 
-        shuffle=True, 
-        num_workers=0,
-        pin_memory=True if DEVICE == 'cuda' else False
-    )
-    val_loader = DataLoader(
-        val_dataset, 
-        batch_size=CONFIG['batch_size'], 
-        shuffle=False, 
-        num_workers=0,
-        pin_memory=True if DEVICE == 'cuda' else False
-    )
-    
-    print(f"✅ Dataset chargé:")
-    print(f"   - Total: {len(full_dataset)} échantillons")
-    print(f"   - Train: {train_size} échantillons")
-    print(f"   - Val: {val_size} échantillons")
-    
-    # ========== 3. VISUALISER DES ÉCHANTILLONS ==========
-    print("\n🖼️  ÉTAPE 3/6: Aperçu du dataset")
-    print("-" * 60)
-    visualize_dataset_samples(full_dataset, num_samples=3)
-    
-    # ========== 4. CRÉER LE MODÈLE ==========
-    print("\n🧠 ÉTAPE 4/6: Création du modèle")
-    print("-" * 60)
-    model = VideoGPT(
-        embed_dim=CONFIG['embed_dim'],
-        num_heads=CONFIG['num_heads'],
-        num_layers=CONFIG['num_layers'],
-        img_size=CONFIG['img_size']
-    )
-    
-    total_params = sum(p.numel() for p in model.parameters())
-    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(f"✅ Modèle créé:")
-    print(f"   - Paramètres totaux: {total_params:,}")
-    print(f"   - Paramètres entraînables: {trainable_params:,}")
-    print(f"   - Taille estimée: {total_params * 4 / 1024 / 1024:.2f} MB")
-    
-    # ========== 5. ENTRAÎNER ==========
-    print("\n🏋️  ÉTAPE 5/6: Entraînement")
-    print("-" * 60)
-    history = train_model(
-        model,
-        train_loader,
-        val_loader,
-        num_epochs=CONFIG['num_epochs'],
-        lr=CONFIG['learning_rate'],
-        device=DEVICE
-    )
-    
-    # Sauvegarder le modèle final
-    torch.save(model.state_dict(), 'video_gpt_final.pth')
-    print("\n✅ Modèle final sauvegardé: video_gpt_final.pth")
-    
-    # Courbe d'apprentissage
-    plt.figure(figsize=(10, 5))
-    plt.plot(history['train_loss'], label='Train Loss')
-    if history['val_loss']:
-        plt.plot(history['val_loss'], label='Validation Loss')
-    plt.xlabel('Epoch')
-    plt.ylabel('Loss (MSE)')
-    plt.title('Courbe d\'apprentissage')
-    plt.legend()
-    plt.grid(True)
-    plt.savefig('training_curve.png', dpi=150, bbox_inches='tight')
-    print("✅ Courbe d'apprentissage sauvegardée: training_curve.png")
-    plt.show()
-    
-    # ========== 6. TESTER ==========
-    print("\n🎯 ÉTAPE 6/6: Test de prédiction")
-    print("-" * 60)
-    
-    # Test 1: Prédiction simple
-    input_frames, target_frame = full_dataset[0]
-    predicted_frame = predict_next_frame(model, input_frames, device=DEVICE)
-    visualize_prediction(input_frames, target_frame, predicted_frame, "test_prediction.png")
-    print("✅ Prédiction simple sauvegardée: test_prediction.png")
-    
-    # Test 2: Prédiction de séquence
-    predictions = predict_sequence(model, input_frames, num_predictions=5, device=DEVICE)
-    visualize_sequence_prediction(input_frames, predictions, "test_sequence.png")
-    
-    print("\n" + "="*60)
-    print("✅ ENTRAÎNEMENT TERMINÉ AVEC SUCCÈS!")
-    print("="*60)
-    print("\n📁 Fichiers générés:")
-    print("   - video_gpt_final.pth (modèle final)")
-    print("   - checkpoints/best_model.pth (meilleur modèle)")
-    print("   - training_curve.png (courbe d'apprentissage)")
-    print("   - dataset_preview.png (aperçu du dataset)")
-    print("   - test_prediction.png (test de prédiction)")
-    print("   - test_sequence.png (test de séquence)")
-    print("\n" + "="*60)
+        print(f"\n❌ ERREUR CRITIQUE:")
+        print(f"{'='*60}")
+        print(f"{e}")
+        print(f"{'='*60}")
+        traceback.print_exc()
+        print(f"\n💡 Conseils de débogage:")
+        print("   1. Vérifiez que le chemin du dataset est correct")
+        print("   2. Réduisez img_size si vous manquez de mémoire GPU")
+        print("   3. Réduisez batch_size si vous manquez de mémoire")
+        print("   4. Vérifiez que CUDA est disponible si vous utilisez GPU")
 
 # ==================== 9. FONCTION POUR CHARGER UN MODÈLE ==========
 def load_model(checkpoint_path, config, device='cuda'):

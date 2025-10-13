@@ -22,7 +22,7 @@ import json
 # ==================== Configuration ====================
 class Config:
     # Chemins
-    FRAMES_DIR = "anime_frames"
+    FRAMES_DIR = "/kaggle/input/anima-s-dataset/test"
     CHECKPOINT_DIR = "checkpoints"
     OUTPUT_DIR = "predictions"
     

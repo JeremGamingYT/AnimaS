@@ -1424,6 +1424,74 @@ def train_predictor_ae(
     return str(out_path_p)
 
 
+def train_unet_next(
+    data_root: str,
+    out_path: str,
+    image_size: int = 128,
+    batch_size: int = 8,
+    epochs: int = 20,
+    lr: float = 1e-4,
+    base_channels: int = 64,
+    bottleneck_channels: int = 512,
+    device: str = "cuda",
+) -> str:
+    """Dataset-wide next-frame predictor in pixel space, no AE/VQ.
+
+    Model: UNetTranslator predicts residual r; y = clamp(x_t + r).
+    Loss: L1 + 0.1*edge + 0.5*SSIM + dynamic-mask consistency.
+    """
+    device_t = torch.device(device if torch.cuda.is_available() or device == "cpu" else "cpu")
+    ds = FramePairDataset(root=data_root, image_size=image_size, is_train=True)
+    dl = DataLoader(ds, batch_size=batch_size, shuffle=True, num_workers=4, pin_memory=True)
+
+    model = UNetTranslator(image_size=image_size, base_channels=base_channels, bottleneck_channels=bottleneck_channels).to(device_t)
+    opt = torch.optim.AdamW(model.parameters(), lr=lr, betas=(0.9, 0.95), weight_decay=0.01)
+    l1 = nn.L1Loss()
+
+    model.train()
+    last_batch = None
+    for epoch in range(1, epochs + 1):
+        pbar = tqdm(dl, desc=f"UNetNext {epoch}/{epochs}")
+        for x_t, x_tp1 in pbar:
+            x_t = x_t.to(device_t, non_blocking=True)
+            x_tp1 = x_tp1.to(device_t, non_blocking=True)
+            last_batch = (x_t, x_tp1)
+
+            r = model(torch.cat([x_t, x_t], dim=1))
+            y = torch.clamp(x_t + r, -1.0, 1.0)
+
+            with torch.no_grad():
+                diff = (x_tp1 - x_t).abs().mean(dim=1, keepdim=True)
+                dyn_mask = (diff > 0.02).float()
+                static_mask = 1.0 - dyn_mask
+
+            loss_rec = l1(y, x_tp1)
+            loss_edge = sobel_edge_loss(y, x_tp1)
+            loss_ssim = ssim_loss_simple(y, x_tp1)
+            loss_dyn = F.l1_loss(y * dyn_mask, x_tp1 * dyn_mask)
+            loss_static_id = F.l1_loss(y * static_mask, x_t * static_mask)
+            loss = loss_rec + 0.1 * loss_edge + 0.5 * loss_ssim + 0.5 * loss_dyn + 0.1 * loss_static_id
+
+            opt.zero_grad(set_to_none=True)
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            opt.step()
+            pbar.set_postfix({"l1": float(loss_rec)})
+
+        if last_batch is not None:
+            model.eval()
+            with torch.no_grad():
+                r_vis = model(torch.cat([last_batch[0][:1], last_batch[0][:1]], dim=1))
+                y_vis = torch.clamp(last_batch[0][:1] + r_vis, -1.0, 1.0)
+            save_image_grid(last_batch[0][:1], y_vis, Path("samples/unet_next"), f"epoch_{epoch:03d}.png")
+            model.train()
+
+    out_path_p = Path(out_path)
+    out_path_p.parent.mkdir(parents=True, exist_ok=True)
+    torch.save({"state_dict": model.state_dict(), "config": {"image_size": image_size, "base_channels": base_channels, "bottleneck_channels": bottleneck_channels}}, out_path_p)
+    return str(out_path_p)
+
+
 @torch.no_grad()
 def predict_next_ae(
     image_path: str,
@@ -1987,6 +2055,18 @@ def parse_cli() -> argparse.Namespace:
     p_eval_ae.add_argument("--num-batches", type=int, default=10)
     p_eval_ae.add_argument("--device", type=str, default="cuda")
 
+    # UNet next-frame trainer (pixel-space)
+    p_unet_next = sub.add_parser("train_unet_next")
+    p_unet_next.add_argument("--data-root", type=str, required=True)
+    p_unet_next.add_argument("--out", type=str, default="checkpoints/unet_next.pt")
+    p_unet_next.add_argument("--image-size", type=int, default=128)
+    p_unet_next.add_argument("--batch-size", type=int, default=8)
+    p_unet_next.add_argument("--epochs", type=int, default=20)
+    p_unet_next.add_argument("--lr", type=float, default=1e-4)
+    p_unet_next.add_argument("--base-channels", type=int, default=64)
+    p_unet_next.add_argument("--bottleneck-channels", type=int, default=512)
+    p_unet_next.add_argument("--device", type=str, default="cuda")
+
     return p.parse_args()
 
 
@@ -2133,6 +2213,19 @@ def main() -> None:
             device=args.device,
         )
         print({"psnr": round(metrics["psnr"], 3), "ssim": round(metrics["ssim"], 4)})
+    elif args.cmd == "train_unet_next":
+        ckpt = train_unet_next(
+            data_root=args.data_root,
+            out_path=args.out,
+            image_size=args.image_size,
+            batch_size=args.batch_size,
+            epochs=args.epochs,
+            lr=args.lr,
+            base_channels=args.base_channels,
+            bottleneck_channels=args.bottleneck_channels,
+            device=args.device,
+        )
+        print(f"Saved UNetNext: {ckpt}")
     elif args.cmd == "train_editor":
         ckpt, meta = train_editor(
             data_root=args.data_root,

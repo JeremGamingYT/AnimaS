@@ -16,7 +16,7 @@ import math
 # ==================== Configuration ====================
 class Config:
     # Chemins
-    dataset_path = "/kaggle/working/AnimaS/frames"  # Changez ceci vers votre dossier
+    dataset_path = "/kaggle/input/anima-s-dataset/test"  # Changez ceci vers votre dossier
     checkpoint_dir = "checkpoints"
     
     # Hyperparamètres

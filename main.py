@@ -14,6 +14,7 @@ En raison de la complexité du pipeline complet, ce script fournit une
 démo simplifiée et doit être adapté pour un véritable usage de production.
 """
 import argparse
+import math
 import os
 import argparse
 from dataclasses import dataclass
@@ -250,20 +251,39 @@ class VectorQuantizer(nn.Module):
         self.dead_code_threshold = float(dead_code_threshold)
         self.dead_code_check_steps = int(dead_code_check_steps)
         self.embedding = nn.Embedding(self.num_embeddings, self.embedding_dim)
-        nn.init.uniform_(self.embedding.weight, -1.0 / self.num_embeddings, 1.0 / self.num_embeddings)
+        # Initialize by embedding_dim scale, not num_embeddings (more stable)
+        nn.init.uniform_(self.embedding.weight, -1.0 / self.embedding_dim, 1.0 / self.embedding_dim)
         if self.use_ema:
             self.register_buffer("ema_cluster_size", torch.zeros(self.num_embeddings))
             self.register_buffer("ema_w", self.embedding.weight.data.clone())
         # Track steps to apply EMA warmup
         self.register_buffer("_steps", torch.zeros((), dtype=torch.long))
+        # One-time lazy data-dependent init flag
+        self.register_buffer("_data_initialized", torch.zeros((), dtype=torch.bool))
 
     def forward(self, z_e: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         # Compute quantization in float32 to avoid NaN/Inf under AMP/FP16
         orig_dtype = z_e.dtype
         b, c, h, w = z_e.shape
         z_e_32 = z_e.float()
+        # Stabilize latent scale: standardize per-batch to unit variance
+        with torch.no_grad():
+            std = z_e_32.std(dim=(0, 2, 3), keepdim=True).clamp_min(self.eps)
+        z_e_32 = z_e_32 / std
         z_e_flat = z_e_32.permute(0, 2, 3, 1).contiguous().view(-1, c)
         emb_w = self.embedding.weight.float()
+
+        # Data-dependent codebook init on first forward pass
+        if self.training and self.use_ema and (not bool(self._data_initialized.item())):
+            with torch.no_grad():
+                # Sample without replacement if possible
+                num_samples = min(self.num_embeddings, z_e_flat.shape[0])
+                idx = torch.randperm(z_e_flat.shape[0], device=z_e_flat.device)[:num_samples]
+                self.embedding.weight.data[:num_samples].copy_(z_e_flat[idx])
+                if self.use_ema:
+                    self.ema_w.data[:num_samples].copy_(z_e_flat[idx])
+                    self.ema_cluster_size.data[:num_samples].fill_(1.0)
+            self._data_initialized.fill_(True)
 
         distances = (
             z_e_flat.pow(2).sum(dim=1, keepdim=True)

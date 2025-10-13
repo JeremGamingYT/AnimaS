@@ -429,10 +429,13 @@ def compute_gradient_penalty(discriminator, real_samples, fake_samples, conditio
     
     d_interpolates = discriminator(condition, interpolates)
     
-    fake = torch.ones(real_samples.size(0), 1, device=device, requires_grad=False)
+    # Moyenne sur les dimensions spatiales pour obtenir une valeur par échantillon
+    d_interpolates = d_interpolates.mean(dim=[2, 3])  # [batch_size, 1]
+    
+    fake = torch.ones_like(d_interpolates, device=device, requires_grad=False)
     
     gradients = torch.autograd.grad(
-        outputs=d_interpolates.view(-1),
+        outputs=d_interpolates,
         inputs=interpolates,
         grad_outputs=fake,
         create_graph=True,

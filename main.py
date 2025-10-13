@@ -675,6 +675,13 @@ def make_random_rect_mask(h: int, w: int) -> torch.Tensor:
     return mask
 
 
+def make_random_edit_mask(h: int, w: int, full_prob: float = 0.2) -> torch.Tensor:
+    """Return a 1xHxW binary mask; with probability full_prob it covers the full image."""
+    if random.random() < full_prob:
+        return torch.ones(1, h, w, dtype=torch.float32)
+    return make_random_rect_mask(h, w)
+
+
 def apply_instruction_masked(x01: torch.Tensor, mask01: torch.Tensor, instr_id: int) -> torch.Tensor:
     """Apply an edit specified by instr_id inside mask on an image tensor in [0,1].
 
@@ -1390,7 +1397,7 @@ def train_editor_from_ae(
             masks = []
             instr_ids = []
             for _ in range(b):
-                masks.append(make_random_rect_mask(h, w))
+                masks.append(make_random_edit_mask(h, w))
                 instr_ids.append(random.randint(0, len(INSTRUCTION_NAMES) - 1))
             mask01 = torch.stack(masks, dim=0).to(device_t)
             instr_ids_t = torch.tensor(instr_ids, dtype=torch.long, device=device_t)
@@ -1420,7 +1427,7 @@ def train_editor_from_ae(
             editor.eval()
             x_vis = last_batch_x[:1]
             b, _, h, w = x_vis.shape
-            mask_vis = make_random_rect_mask(h, w).to(device_t).unsqueeze(0)
+            mask_vis = make_random_edit_mask(h, w).to(device_t).unsqueeze(0)
             instr_vis = random.randint(0, len(INSTRUCTION_NAMES) - 1)
             cond_vis = build_editor_condition(mask_vis, torch.tensor([instr_vis], device=device_t), h, w, len(INSTRUCTION_NAMES))
             with torch.no_grad():
@@ -1458,7 +1465,7 @@ def edit_image_unet(
     ])
     x = tfm(img).unsqueeze(0).to(device_t)
     _, _, h, w = x.shape
-    mask = make_random_rect_mask(h, w).to(device_t).unsqueeze(0)
+    mask = make_random_edit_mask(h, w).to(device_t).unsqueeze(0)
     instr_id = instruction_name_to_id(instruction)
     cond = build_editor_condition(mask, torch.tensor([instr_id], device=device_t), h, w, len(INSTRUCTION_NAMES))
     out = editor(torch.cat([x, cond], dim=1))

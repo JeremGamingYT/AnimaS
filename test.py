@@ -1,233 +1,204 @@
-import tensorflow as tf
-from tensorflow.keras import layers, Model
-from tensorflow.keras.callbacks import Callback
-import numpy as np
+from __future__ import annotations
+
+import argparse
 import os
+from typing import List, Tuple
+
+import numpy as np
 from PIL import Image
 import matplotlib.pyplot as plt
-import cv2  # OpenCV est nécessaire pour le filtrage
-from shutil import move, rmtree
+from sklearn.decomposition import PCA
+# Nous utilisons un KNN pour améliorer la qualité des prédictions.
+from sklearn.neighbors import KNeighborsRegressor
+from sklearn.model_selection import train_test_split
 
-# ==============================================================================
-# PARTIE 1 : FONCTION DE PRÉ-TRAITEMENT DU DATASET
-# ==============================================================================
 
-def filter_dataset(source_folder, keep_folder, discard_folder, min_diff=1.5, max_diff=35.0):
-    """
-    Filtre un dataset de frames pour ne garder que celles avec un mouvement modéré.
-    Cette fonction déplace les fichiers, elle ne les copie pas.
+def load_frames(data_dir: str) -> List[np.ndarray]:
+    """Charge et retourne toutes les images PNG du dossier donné.
+
+    Les images sont triées par ordre alphabétique (supposé correspondre
+    à l'ordre chronologique). Chaque image est convertie en niveaux de gris
+    et normalisée dans [0,1].
 
     Args:
-        source_folder (str): Dossier contenant les frames originales.
-        keep_folder (str): Dossier où stocker les frames utiles pour l'entraînement.
-        discard_folder (str): Dossier où stocker les frames rejetées (cuts/statiques).
-        min_diff (float): Seuil de différence minimal (en %). En dessous, l'image est jugée trop statique.
-        max_diff (float): Seuil de différence maximal (en %). Au-dessus, c'est probablement un cut.
+        data_dir: chemin du dossier contenant les images.
+
+    Returns:
+        Liste de tableaux numpy de shape (H, W) en float32.
     """
-    print("--- DÉBUT DU FILTRAGE DU DATASET ---")
-    if os.path.exists(keep_folder): rmtree(keep_folder)
-    if os.path.exists(discard_folder): rmtree(discard_folder)
-    os.makedirs(keep_folder, exist_ok=True)
-    os.makedirs(discard_folder, exist_ok=True)
-
-    files = sorted([f for f in os.listdir(source_folder) if f.lower().endswith(('.png', '.jpg', '.jpeg'))])
-    if not files:
-        print(f"ERREUR: Aucun fichier image trouvé dans '{source_folder}'.")
-        return
-
-    prev_frame_gray = None
-    kept_files_count = 0
-
-    for i, filename in enumerate(files):
-        filepath = os.path.join(source_folder, filename)
-        frame = cv2.imread(filepath)
-        if frame is None:
-            print(f"Attention: Impossible de lire le fichier {filename}, il sera ignoré.")
-            continue
-        
-        frame_gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-
-        # La toute première frame est toujours gardée comme point de départ
-        if i == 0:
-            prev_frame_gray = frame_gray
-            move(filepath, os.path.join(keep_folder, filename))
-            kept_files_count += 1
-            continue
-
-        # Calcul de la différence avec la frame précédente
-        diff = cv2.absdiff(prev_frame_gray, frame_gray)
-        non_zero_count = np.count_nonzero(diff)
-        diff_percent = (non_zero_count / diff.size) * 100
-
-        # Décision de garder ou de jeter la frame
-        if min_diff < diff_percent < max_diff:
-            print(f"CONSERVER : {filename} (Différence: {diff_percent:.2f}%)")
-            move(filepath, os.path.join(keep_folder, filename))
-            kept_files_count += 1
-        else:
-            reason = "STATIQUE" if diff_percent <= min_diff else "CUT"
-            print(f"REJETER   : {filename} (Différence: {diff_percent:.2f}%) - Raison: {reason}")
-            move(filepath, os.path.join(discard_folder, filename))
-        
-        prev_frame_gray = frame_gray
-    
-    print(f"--- FILTRAGE TERMINÉ ---")
-    print(f"Total des images conservées : {kept_files_count} / {len(files)}")
-    print(f"Les images pour l'entraînement sont dans le dossier : '{keep_folder}'")
+    files = [f for f in os.listdir(data_dir) if f.lower().endswith(".png")]
+    files.sort()
+    frames = []
+    for fname in files:
+        path = os.path.join(data_dir, fname)
+        img = Image.open(path).convert("L")  # niveaux de gris
+        arr = np.array(img, dtype=np.float32) / 255.0
+        frames.append(arr)
+    return frames
 
 
-# ==============================================================================
-# PARTIE 2 : MODÈLE U-NET ET ENTRAÎNEMENT
-# ==============================================================================
+def prepare_dataset(frames: List[np.ndarray]) -> Tuple[np.ndarray, np.ndarray]:
+    """Prépare les paires (frame_t, frame_{t+1}).
 
-def unet_model(input_size=(128, 128, 3)):
-    """Création d'un modèle U-Net standard."""
-    inputs = layers.Input(input_size)
-    # Encodeur
-    c1 = layers.Conv2D(64, (3, 3), activation='relu', kernel_initializer='he_normal', padding='same')(inputs)
-    c1 = layers.Dropout(0.1)(c1)
-    c1 = layers.Conv2D(64, (3, 3), activation='relu', kernel_initializer='he_normal', padding='same')(c1)
-    p1 = layers.MaxPooling2D((2, 2))(c1)
-    c2 = layers.Conv2D(128, (3, 3), activation='relu', kernel_initializer='he_normal', padding='same')(p1)
-    c2 = layers.Dropout(0.1)(c2)
-    c2 = layers.Conv2D(128, (3, 3), activation='relu', kernel_initializer='he_normal', padding='same')(c2)
-    p2 = layers.MaxPooling2D((2, 2))(c2)
-    # Bottleneck
-    c5 = layers.Conv2D(256, (3, 3), activation='relu', kernel_initializer='he_normal', padding='same')(p2)
-    c5 = layers.Dropout(0.2)(c5)
-    c5 = layers.Conv2D(256, (3, 3), activation='relu', kernel_initializer='he_normal', padding='same')(c5)
-    # Décodeur
-    u6 = layers.Conv2DTranspose(128, (2, 2), strides=(2, 2), padding='same')(c5)
-    u6 = layers.concatenate([u6, c2])
-    c6 = layers.Conv2D(128, (3, 3), activation='relu', kernel_initializer='he_normal', padding='same')(u6)
-    c6 = layers.Dropout(0.2)(c6)
-    c6 = layers.Conv2D(128, (3, 3), activation='relu', kernel_initializer='he_normal', padding='same')(c6)
-    u7 = layers.Conv2DTranspose(64, (2, 2), strides=(2, 2), padding='same')(c6)
-    u7 = layers.concatenate([u7, c1])
-    c7 = layers.Conv2D(64, (3, 3), activation='relu', kernel_initializer='he_normal', padding='same')(u7)
-    c7 = layers.Dropout(0.1)(c7)
-    c7 = layers.Conv2D(64, (3, 3), activation='relu', kernel_initializer='he_normal', padding='same')(c7)
-    outputs = layers.Conv2D(3, (1, 1), activation='sigmoid')(c7)
-    model = Model(inputs=[inputs], outputs=[outputs])
-    return model
+    Args:
+        frames: liste d'images dans l'ordre chronologique.
 
-def load_data(data_path, img_size=(128, 128)):
-    """Charge les images et crée les paires (frame_N, frame_N+1)."""
-    X, y = [], []
-    image_files = sorted([f for f in os.listdir(data_path) if f.lower().endswith(('.png', '.jpg', '.jpeg'))])
-    
-    if len(image_files) < 2:
-        raise ValueError(f"Le dossier '{data_path}' doit contenir au moins 2 images pour créer une paire.")
+    Returns:
+        Tuple (X, Y) où X correspond aux frames d'entrée et Y aux
+        frames cibles (images suivantes). Les dimensions sont
+        (n_pairs, H*W).
+    """
+    if len(frames) < 2:
+        raise ValueError("Au moins deux images sont nécessaires pour créer des paires.")
+    images = np.stack(frames)
+    # Créer les paires successives
+    X = images[:-1]
+    Y = images[1:]
+    n_samples, H, W = X.shape
+    # Aplatir
+    return X.reshape(n_samples, H * W), Y.reshape(n_samples, H * W)
 
-    print(f"Chargement de {len(image_files) - 1} paires d'images depuis '{data_path}'...")
-    for i in range(len(image_files) - 1):
-        img_path_current = os.path.join(data_path, image_files[i])
-        img_current = Image.open(img_path_current).convert('RGB').resize(img_size)
-        X.append(np.array(img_current))
 
-        img_path_next = os.path.join(data_path, image_files[i+1])
-        img_next = Image.open(img_path_next).convert('RGB').resize(img_size)
-        y.append(np.array(img_next))
+def train_pca_regression(
+    X: np.ndarray, Y: np.ndarray, n_components: int, test_size: float = 0.2, random_state: int = 0
+) -> Tuple[PCA, LinearRegression, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Entraîne une PCA et un modèle KNN pour prédire Y à partir de X.
 
-    X = np.array(X) / 255.0
-    y = np.array(y) / 255.0
-    return X, y
+    Args:
+        X: frames d'entrée aplaties (n_samples, n_features).
+        Y: frames de sortie aplaties (n_samples, n_features).
+        n_components: nombre de composantes principales à conserver.
+        test_size: fraction du jeu réservée au test.
+        random_state: graine pour la séparation des données.
 
-class SaveEpochPrediction(Callback):
-    """Callback pour sauvegarder une prédiction à la fin de chaque époque."""
-    def __init__(self, test_image, save_path):
-        super(Callback, self).__init__()
-        self.test_image = np.expand_dims(test_image, axis=0)
-        self.save_path = save_path
-
-    def on_epoch_end(self, epoch, logs=None):
-        predicted_frame = self.model.predict(self.test_image, verbose=0)[0]
-        predicted_frame = (predicted_frame * 255).astype(np.uint8)
-        img = Image.fromarray(predicted_frame)
-        img.save(os.path.join(self.save_path, f'epoch_{epoch+1:03d}.png'))
-
-# ==============================================================================
-# PARTIE 3 : EXÉCUTION
-# ==============================================================================
-
-if __name__ == '__main__':
-    # --- CONFIGURATION ---
-    IMAGE_HEIGHT = 128
-    IMAGE_WIDTH = 128
-    
-    # 1. Dossier contenant TOUTES vos frames originales
-    SOURCE_DATA_PATH = 'anime_frames_original'
-    
-    # 2. Dossier qui contiendra les frames "propres" après filtrage
-    CLEANED_DATA_PATH = '/kaggle/input/anima-s-dataset/test'
-    
-    # 3. Dossier pour les frames rejetées (pour vérification)
-    DISCARDED_DATA_PATH = 'anime_frames_discarded'
-    
-    # 4. Dossier pour sauvegarder les résultats du modèle
-    RESULTS_PATH = 'results'
-
-    # --- ÉTAPE 1: FILTRAGE (à exécuter une seule fois) ---
-    # Décommentez la ligne ci-dessous pour lancer le filtrage.
-    # Une fois terminé, vous pouvez la re-commenter.
-    # --------------------------------------------------------------------------
-    # filter_dataset(SOURCE_DATA_PATH, CLEANED_DATA_PATH, DISCARDED_DATA_PATH)
-    # --------------------------------------------------------------------------
-
-    # --- ÉTAPE 2: ENTRAÎNEMENT DU MODÈLE ---
-    # Assurez-vous que le filtrage a été fait et que le dossier CLEANED_DATA_PATH existe.
-    if not os.path.exists(CLEANED_DATA_PATH) or not os.listdir(CLEANED_DATA_PATH):
-        print(f"\nERREUR: Le dossier '{CLEANED_DATA_PATH}' est vide ou n'existe pas.")
-        print("Veuillez d'abord exécuter l'étape de filtrage en décommentant la ligne `filter_dataset(...)`.")
-        exit()
-
-    print("\n--- DÉBUT DE L'ENTRAÎNEMENT DU MODÈLE ---")
-    
-    # Création des dossiers de résultats
-    EPOCH_PREVIEWS_PATH = os.path.join(RESULTS_PATH, 'epoch_previews')
-    os.makedirs(EPOCH_PREVIEWS_PATH, exist_ok=True)
-        
-    # Chargement des données NETTOYÉES
-    try:
-        X_train, y_train = load_data(CLEANED_DATA_PATH, img_size=(IMAGE_HEIGHT, IMAGE_WIDTH))
-    except ValueError as e:
-        print(f"ERREUR : {e}")
-        exit()
-        
-    # Création du modèle
-    model = unet_model(input_size=(IMAGE_HEIGHT, IMAGE_WIDTH, 3))
-    model.compile(optimizer='adam', loss='mean_absolute_error', metrics=['mae']) # Utilisation de MAE (L1), souvent meilleure pour les images
-    model.summary()
-    
-    # Création du Callback pour sauvegarder la progression
-    save_callback = SaveEpochPrediction(test_image=X_train[0], save_path=EPOCH_PREVIEWS_PATH)
-
-    # Entraînement
-    history = model.fit(
-        X_train, 
-        y_train, 
-        epochs=150,       # Augmentez si nécessaire
-        batch_size=8,       # Ajustez selon la VRAM de votre GPU
-        validation_split=0.1,
-        callbacks=[save_callback]
+    Returns:
+        Tuple (pca, reg, X_test_pca, Y_test_pca, X_test, Y_test) contenant la PCA
+        ajustée, le KNN entraîné, les représentations PCA du jeu de test
+        et les images aplaties correspondantes pour évaluation.
+    """
+    # Limiter le nombre de composantes au maximum autorisé
+    max_components = min(n_components, min(X.shape[0] + Y.shape[0] - 2, X.shape[1]))
+    pca = PCA(n_components=max_components)
+    # Ajuster la PCA sur l'ensemble des frames (entrées et sorties)
+    pca.fit(np.concatenate([X, Y], axis=0))
+    # Transformer
+    X_pca = pca.transform(X)
+    Y_pca = pca.transform(Y)
+    # Séparation entraînement/test
+    X_train_pca, X_test_pca, Y_train_pca, Y_test_pca, X_train, X_test, Y_train, Y_test = train_test_split(
+        X_pca, Y_pca, X, Y, test_size=test_size, random_state=random_state
     )
-    
-    # Sauvegarde du modèle final
-    FINAL_MODEL_PATH = os.path.join(RESULTS_PATH, 'unet_anime_predictor_v2.h5')
-    print(f"\nEntraînement terminé. Sauvegarde du modèle final à : {FINAL_MODEL_PATH}")
-    model.save(FINAL_MODEL_PATH)
+    # Modèle KNN : pour chaque représentation PCA, on cherche les k plus
+    # proches voisins dans l’espace de représentation et on moyenne leurs
+    # frames suivantes. Les poids basés sur la distance améliorent les
+    # prédictions en donnant plus d’importance aux voisins les plus proches.
+    knn_reg = KNeighborsRegressor(n_neighbors=3, weights="distance")
+    knn_reg.fit(X_train_pca, Y_train_pca)
+    return pca, knn_reg, X_test_pca, Y_test_pca, X_test, Y_test
 
-    # Prédiction et visualisation finale
-    print("\nCréation de l'image de comparaison finale...")
-    input_frame = np.expand_dims(X_train[0], axis=0)
-    predicted_frame = model.predict(input_frame)[0]
 
-    fig, axes = plt.subplots(1, 3, figsize=(18, 6))
-    axes[0].imshow(X_train[0]); axes[0].set_title("Frame d'Entrée (N)"); axes[0].axis('off')
-    axes[1].imshow(y_train[0]); axes[1].set_title("Frame Réelle Suivante (N+1)"); axes[1].axis('off')
-    axes[2].imshow(predicted_frame); axes[2].set_title("Frame Prédite Finale"); axes[2].axis('off')
-    
-    final_comparison_path = os.path.join(RESULTS_PATH, 'final_prediction_comparison.png')
-    plt.savefig(final_comparison_path)
-    print(f"Image de comparaison finale enregistrée à : {final_comparison_path}")
+def reconstruct_and_plot(
+    pca: PCA,
+    reg: LinearRegression,
+    X_test_pca: np.ndarray,
+    Y_test_pca: np.ndarray,
+    num_examples: int = 5,
+    save_path: str | None = None,
+    original_shape: Tuple[int, int] = (256, 256),
+) -> None:
+    """Reconstruit et affiche quelques exemples de prédictions.
+
+    Args:
+        pca: modèle PCA entraîné.
+        reg: modèle de régression linéaire entraîné.
+        X_test_pca: représentations PCA des frames d'entrée de test.
+        Y_test_pca: représentations PCA des frames réelles de test.
+        num_examples: nombre d'exemples à afficher.
+        save_path: chemin pour sauvegarder la figure. Si None, la figure n'est
+            pas sauvegardée.
+        original_shape: tuple (H, W) de la taille des images originales.
+    """
+    n_examples = min(num_examples, len(X_test_pca))
+    H, W = original_shape
+    fig, axes = plt.subplots(n_examples, 3, figsize=(8, 2.5 * n_examples))
+    if n_examples == 1:
+        axes = np.expand_dims(axes, axis=0)
+    preds_pca = reg.predict(X_test_pca[:n_examples])
+    for i in range(n_examples):
+        inp_img = pca.inverse_transform(X_test_pca[i]).reshape(H, W)
+        true_img = pca.inverse_transform(Y_test_pca[i]).reshape(H, W)
+        pred_img = pca.inverse_transform(preds_pca[i]).reshape(H, W)
+        axes[i, 0].imshow(inp_img, cmap="gray", vmin=0, vmax=1)
+        axes[i, 0].set_title("Frame 1")
+        axes[i, 1].imshow(true_img, cmap="gray", vmin=0, vmax=1)
+        axes[i, 1].set_title("Frame 2 (réelle)")
+        axes[i, 2].imshow(np.clip(pred_img, 0, 1), cmap="gray", vmin=0, vmax=1)
+        axes[i, 2].set_title("Frame 2 (prédite)")
+        for j in range(3):
+            axes[i, j].axis("off")
+    plt.tight_layout()
+    if save_path:
+        plt.savefig(save_path)
     plt.show()
+    plt.close(fig)
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Prédiction de la frame suivante sur un jeu d'images animées.")
+    parser.add_argument(
+        "--data_dir",
+        type=str,
+        required=True,
+        help="Chemin du dossier contenant les images (frames).",
+    )
+    parser.add_argument(
+        "--n_components",
+        type=int,
+        default=50,
+        help="Nombre de composantes principales à conserver pour la PCA.",
+    )
+    parser.add_argument(
+        "--test_size",
+        type=float,
+        default=0.2,
+        help="Fraction du jeu utilisée pour le test (entre 0 et 1).",
+    )
+    parser.add_argument(
+        "--examples",
+        type=int,
+        default=5,
+        help="Nombre d'exemples à afficher dans la figure finale.",
+    )
+    args = parser.parse_args()
+    # Chargement des images
+    print(f"Chargement des images depuis {args.data_dir}…")
+    frames = load_frames(args.data_dir)
+    H, W = frames[0].shape
+    print(f"{len(frames)} images chargées. Taille des images : {H}x{W}.")
+    # Préparation des paires
+    X, Y = prepare_dataset(frames)
+    print(f"Nombre de paires (frame_t, frame_t+1) : {len(X)}")
+    # Entraînement PCA + régression
+    pca, reg, X_test_pca, Y_test_pca, X_test, Y_test = train_pca_regression(
+        X, Y, n_components=args.n_components, test_size=args.test_size
+    )
+    # Calcul de l'erreur MSE en espace PCA
+    mse_pca = np.mean((reg.predict(X_test_pca) - Y_test_pca) ** 2)
+    print(f"Erreur quadratique moyenne dans l'espace PCA : {mse_pca:.4f}")
+    # Affichage et sauvegarde
+    output_path = "predictions_anime.png"
+    print(f"Sauvegarde de la figure des prédictions dans {output_path}…")
+    reconstruct_and_plot(
+        pca,
+        reg,
+        X_test_pca,
+        Y_test_pca,
+        num_examples=args.examples,
+        save_path=output_path,
+        original_shape=(H, W),
+    )
+    print("Terminé.")
+
+
+if __name__ == "__main__":
+    main()

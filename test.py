@@ -385,6 +385,12 @@ class EdgeLoss(nn.Module):
         self.sobel_y.weight = nn.Parameter(sobel_y_kernel, requires_grad=False)
     
     def forward(self, pred, target):
+        # Move filters to the same device and dtype as input
+        self.sobel_x = self.sobel_x.to(pred.device)
+        self.sobel_y = self.sobel_y.to(pred.device)
+        self.sobel_x.weight.data = self.sobel_x.weight.data.to(pred.dtype)
+        self.sobel_y.weight.data = self.sobel_y.weight.data.to(pred.dtype)
+        
         # Convert to grayscale
         pred_gray = 0.299 * pred[:, 0:1] + 0.587 * pred[:, 1:2] + 0.114 * pred[:, 2:3]
         target_gray = 0.299 * target[:, 0:1] + 0.587 * target[:, 1:2] + 0.114 * target[:, 2:3]

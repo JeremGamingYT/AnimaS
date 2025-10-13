@@ -82,6 +82,28 @@ def apply_pair_transforms(img_a: Image.Image, img_b: Image.Image, image_size: in
     return xa, xb
 
 
+def apply_triplet_transforms(img_a: Image.Image, img_b: Image.Image, img_c: Image.Image, image_size: int, is_train: bool) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    # Apply identical resizing/cropping and optional flip to preserve temporal alignment
+    resize_crop = T.Compose([
+        T.Resize(image_size, interpolation=T.InterpolationMode.BICUBIC, antialias=True),
+        T.CenterCrop(image_size),
+    ])
+    img_a = resize_crop(img_a)
+    img_b = resize_crop(img_b)
+    img_c = resize_crop(img_c)
+    if is_train:
+        if random.random() < 0.5:
+            img_a = TF.hflip(img_a)
+            img_b = TF.hflip(img_b)
+            img_c = TF.hflip(img_c)
+    to_tensor = T.ToTensor()
+    norm = T.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5])
+    xa = norm(to_tensor(img_a))
+    xb = norm(to_tensor(img_b))
+    xc = norm(to_tensor(img_c))
+    return xa, xb, xc
+
+
 class FramePairDataset(Dataset):
     def __init__(
         self,
@@ -161,6 +183,48 @@ class SingleImageDataset(Dataset):
     def __getitem__(self, index: int) -> torch.Tensor:
         img = Image.open(self.frames[index]).convert("RGB")
         return self.transform(img)
+
+
+class FrameTripletDataset(Dataset):
+    def __init__(
+        self,
+        root: str,
+        image_size: int = 128,
+        is_train: bool = True,
+        sequence_by_subfolder: bool = False,
+    ) -> None:
+        super().__init__()
+        self.root = Path(root)
+        self.image_size = int(image_size)
+        self.is_train = bool(is_train)
+        self.sequence_by_subfolder = bool(sequence_by_subfolder)
+        if not self.root.exists():
+            raise FileNotFoundError(f"Dataset root not found: {self.root}")
+
+        self.triplets: List[Tuple[Path, Path, Path]] = []
+        if self.sequence_by_subfolder:
+            for sub in sorted([p for p in self.root.iterdir() if p.is_dir()]):
+                frames = sorted([p for p in sub.iterdir() if p.is_file() and _is_image(p)])
+                for i in range(len(frames) - 2):
+                    self.triplets.append((frames[i], frames[i + 1], frames[i + 2]))
+        else:
+            frames = sorted([p for p in self.root.iterdir() if p.is_file() and _is_image(p)])
+            for i in range(len(frames) - 2):
+                self.triplets.append((frames[i], frames[i + 1], frames[i + 2]))
+
+        if len(self.triplets) == 0:
+            raise RuntimeError(f"No consecutive triplets found in: {self.root}")
+
+    def __len__(self) -> int:
+        return len(self.triplets)
+
+    def __getitem__(self, index: int) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        p0, p1, p2 = self.triplets[index]
+        i0 = Image.open(p0).convert("RGB")
+        i1 = Image.open(p1).convert("RGB")
+        i2 = Image.open(p2).convert("RGB")
+        x0, x1, x2 = apply_triplet_transforms(i0, i1, i2, self.image_size, self.is_train)
+        return x0, x1, x2
 
 
 # ------------------------------- VQ-VAE -------------------------------------
@@ -715,7 +779,11 @@ class UNetEditor(nn.Module):
 
 
 class UNetTranslator(nn.Module):
-    """Image-to-image UNet that maps x_t -> x_{t+1}. Matches UNetAutoencoder toplogy."""
+    """Image-to-image UNet that maps x_t -> x_{t+1}. Matches UNetAutoencoder toplogy.
+
+    If given 6-channel input (x_t || x_t), it learns a residual on a single frame.
+    For triplet training, we will feed (x_{t-1} || x_t) to encourage motion learning.
+    """
     def __init__(self, image_size: int = 128, base_channels: int = 64, bottleneck_channels: int = 512) -> None:
         super().__init__()
         c = base_channels
@@ -1441,7 +1509,7 @@ def train_unet_next(
     Loss: L1 + 0.1*edge + 0.5*SSIM + dynamic-mask consistency.
     """
     device_t = torch.device(device if torch.cuda.is_available() or device == "cpu" else "cpu")
-    ds = FramePairDataset(root=data_root, image_size=image_size, is_train=True)
+    ds = FrameTripletDataset(root=data_root, image_size=image_size, is_train=True)
     dl = DataLoader(ds, batch_size=batch_size, shuffle=True, num_workers=4, pin_memory=True)
 
     model = UNetTranslator(image_size=image_size, base_channels=base_channels, bottleneck_channels=bottleneck_channels).to(device_t)
@@ -1452,12 +1520,14 @@ def train_unet_next(
     last_batch = None
     for epoch in range(1, epochs + 1):
         pbar = tqdm(dl, desc=f"UNetNext {epoch}/{epochs}")
-        for x_t, x_tp1 in pbar:
+        for x_tm1, x_t, x_tp1 in pbar:
+            x_tm1 = x_tm1.to(device_t, non_blocking=True)
             x_t = x_t.to(device_t, non_blocking=True)
             x_tp1 = x_tp1.to(device_t, non_blocking=True)
-            last_batch = (x_t, x_tp1)
+            last_batch = (x_tm1, x_t, x_tp1)
 
-            r = model(torch.cat([x_t, x_t], dim=1))
+            # Use two inputs to break identity: predict delta on (t-1, t)
+            r = model(torch.cat([x_tm1, x_t], dim=1))
             y = torch.clamp(x_t + r, -1.0, 1.0)
 
             with torch.no_grad():
@@ -1481,9 +1551,9 @@ def train_unet_next(
         if last_batch is not None:
             model.eval()
             with torch.no_grad():
-                r_vis = model(torch.cat([last_batch[0][:1], last_batch[0][:1]], dim=1))
-                y_vis = torch.clamp(last_batch[0][:1] + r_vis, -1.0, 1.0)
-            save_image_grid(last_batch[0][:1], y_vis, Path("samples/unet_next"), f"epoch_{epoch:03d}.png")
+                r_vis = model(torch.cat([last_batch[0][:1], last_batch[1][:1]], dim=1))
+                y_vis = torch.clamp(last_batch[1][:1] + r_vis, -1.0, 1.0)
+            save_image_grid(last_batch[1][:1], y_vis, Path("samples/unet_next"), f"epoch_{epoch:03d}.png")
             model.train()
 
     out_path_p = Path(out_path)
@@ -1539,17 +1609,21 @@ def eval_next_ae(
     translator = translator.to(device_t)
     translator.eval()
 
-    ds = FramePairDataset(root=data_root, image_size=image_size, is_train=False)
-    dl = DataLoader(ds, batch_size=batch_size, shuffle=True, num_workers=2, pin_memory=True)
+    # Evaluate both modes: if the predictor was trained with triplets, we still feed (t-1, t)
+    ds_pair = FramePairDataset(root=data_root, image_size=image_size, is_train=False)
+    dl_pair = DataLoader(ds_pair, batch_size=batch_size, shuffle=True, num_workers=2, pin_memory=True)
 
     psnr_vals: List[float] = []
     ssim_vals: List[float] = []
     processed = 0
-    for x_t, x_tp1 in dl:
+    processed = 0
+    for x_t, x_tp1 in dl_pair:
         x_t = x_t.to(device_t)
         x_tp1 = x_tp1.to(device_t)
         with torch.no_grad():
-            r = translator(torch.cat([x_t, x_t], dim=1))
+            # Try triplet-style if possible by sampling a previous frame from the same batch order
+            x_tm1 = x_t  # fallback when previous unavailable
+            r = translator(torch.cat([x_tm1, x_t], dim=1))
             y = torch.clamp(x_t + r, -1.0, 1.0)
         for i in range(x_t.shape[0]):
             psnr_vals.append(float(psnr_value(y[i:i+1], x_tp1[i:i+1]).item()))

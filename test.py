@@ -9,7 +9,6 @@ from PIL import Image
 import numpy as np
 import os
 from pathlib import Path
-import matplotlib.pyplot as plt
 from tqdm import tqdm
 import cv2
 import random
@@ -18,11 +17,12 @@ import lpips
 import math
 from einops import rearrange, repeat
 from einops.layers.torch import Rearrange
+import json
 
 # ==================== Configuration ====================
 class Config:
     # Chemins
-    FRAMES_DIR = "/kaggle/input/anima-s-dataset/test"
+    FRAMES_DIR = "anime_frames"
     CHECKPOINT_DIR = "checkpoints"
     OUTPUT_DIR = "predictions"
     
@@ -30,9 +30,9 @@ class Config:
     SEQUENCE_LENGTH = 5
     IMG_SIZE = (256, 256)
     BATCH_SIZE = 4
-    GRADIENT_ACCUMULATION_STEPS = 4  # Pour simuler un batch plus grand
-    LEARNING_RATE_G = 0.0002  # Generator
-    LEARNING_RATE_D = 0.0001  # Discriminator
+    GRADIENT_ACCUMULATION_STEPS = 4
+    LEARNING_RATE_G = 0.0002
+    LEARNING_RATE_D = 0.0001
     NUM_EPOCHS = 200
     DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     
@@ -54,7 +54,64 @@ class Config:
     USE_MIXED_PRECISION = True
     CLIP_GRAD_NORM = 1.0
 
-# ==================== Vision Transformer Block ====================
+# ==================== Utility Functions ====================
+def save_image_grid(images, save_path, titles=None):
+    """Sauvegarder une grille d'images avec OpenCV au lieu de matplotlib"""
+    n_images = len(images)
+    
+    # Convertir les tensors en numpy arrays
+    np_images = []
+    for img in images:
+        if isinstance(img, torch.Tensor):
+            img = img.detach().cpu().numpy()
+            if img.shape[0] == 3:  # CHW -> HWC
+                img = np.transpose(img, (1, 2, 0))
+        
+        # Dénormaliser si nécessaire
+        if img.min() < 0:
+            img = (img + 1) / 2
+        
+        # Clip et convertir en uint8
+        img = np.clip(img * 255, 0, 255).astype(np.uint8)
+        
+        # Convert RGB to BGR for OpenCV
+        if img.shape[2] == 3:
+            img = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
+        
+        np_images.append(img)
+    
+    # Créer une grille horizontale
+    height = np_images[0].shape[0]
+    width = np_images[0].shape[1]
+    
+    # Ajouter du padding entre les images
+    padding = 10
+    grid_width = n_images * width + (n_images - 1) * padding
+    grid_height = height
+    
+    # Créer l'image de grille
+    grid = np.ones((grid_height + 50, grid_width, 3), dtype=np.uint8) * 255
+    
+    # Placer les images
+    for i, img in enumerate(np_images):
+        x_start = i * (width + padding)
+        grid[30:30+height, x_start:x_start+width] = img
+        
+        # Ajouter les titres si fournis
+        if titles and i < len(titles):
+            cv2.putText(grid, titles[i], (x_start, 20), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 1)
+    
+    # Sauvegarder
+    cv2.imwrite(save_path, grid)
+    print(f"📸 Image sauvegardée: {save_path}")
+
+def save_training_metrics(metrics, save_path):
+    """Sauvegarder les métriques d'entraînement en JSON"""
+    with open(save_path, 'w') as f:
+        json.dump(metrics, f, indent=2)
+
+# ==================== Vision Transformer Components ====================
 class MultiHeadAttention(nn.Module):
     def __init__(self, dim, heads=8, dim_head=64, dropout=0.):
         super().__init__()
@@ -100,28 +157,24 @@ class TransformerBlock(nn.Module):
         x = self.mlp(self.norm2(x)) + x
         return x
 
-# ==================== Advanced Dataset with Augmentation ====================
+# ==================== Enhanced Dataset ====================
 class EnhancedAnimeDataset(Dataset):
     def __init__(self, frames_dir, sequence_length=5, transform=None, augment=True):
         self.frames_dir = Path(frames_dir)
         self.sequence_length = sequence_length
         self.augment = augment
         
-        # Transformations de base
         self.base_transform = transforms.Compose([
             transforms.Resize(Config.IMG_SIZE),
-            transforms.ToTensor()
+            transforms.ToTensor(),
+            transforms.Normalize([0.5, 0.5, 0.5], [0.5, 0.5, 0.5])
         ])
         
-        # Augmentation
         self.augmentation = transforms.Compose([
             transforms.RandomHorizontalFlip(p=0.5),
             transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2, hue=0.1),
             transforms.RandomAffine(degrees=5, translate=(0.05, 0.05), scale=(0.95, 1.05)),
         ]) if augment else None
-        
-        # Temporal augmentation
-        self.temporal_augment = augment
         
         self.frame_paths = sorted(self.frames_dir.glob("frame_*.png"))
         self.num_sequences = len(self.frame_paths) - sequence_length
@@ -129,26 +182,12 @@ class EnhancedAnimeDataset(Dataset):
         if self.num_sequences <= 0:
             raise ValueError(f"Pas assez de frames. Minimum requis: {sequence_length + 1}")
     
-    def apply_temporal_augmentation(self, frames):
-        """Applique des augmentations temporelles cohérentes"""
-        if not self.temporal_augment or random.random() > 0.5:
-            return frames
-        
-        # Speed variation (frame skipping/interpolation)
-        speed_factor = random.uniform(0.8, 1.2)
-        
-        # Pour simplifier, on retourne les frames normales
-        # Dans une implémentation complète, on pourrait interpoler
-        return frames
-    
     def __len__(self):
         return self.num_sequences
     
     def __getitem__(self, idx):
-        # Charger les frames
         input_frames = []
         
-        # Paramètres d'augmentation cohérents pour la séquence
         if self.augment:
             seed = random.randint(0, 2**32)
         
@@ -156,7 +195,6 @@ class EnhancedAnimeDataset(Dataset):
             frame_path = self.frame_paths[idx + i]
             frame = Image.open(frame_path).convert('RGB')
             
-            # Augmentation cohérente
             if self.augmentation and self.augment:
                 random.seed(seed)
                 torch.manual_seed(seed)
@@ -165,7 +203,6 @@ class EnhancedAnimeDataset(Dataset):
             frame = self.base_transform(frame)
             input_frames.append(frame)
         
-        # Frame cible
         target_frame_path = self.frame_paths[idx + self.sequence_length]
         target_frame = Image.open(target_frame_path).convert('RGB')
         
@@ -180,127 +217,7 @@ class EnhancedAnimeDataset(Dataset):
         
         return input_tensor, target_frame
 
-# ==================== Generator avec Vision Transformer ====================
-class HybridGenerator(nn.Module):
-    """Générateur hybride CNN + Vision Transformer"""
-    
-    def __init__(self, config):
-        super().__init__()
-        self.config = config
-        
-        # Encoder CNN pour extraction de features
-        self.encoder = nn.Sequential(
-            nn.Conv2d(3, 64, 4, 2, 1),
-            nn.BatchNorm2d(64),
-            nn.LeakyReLU(0.2),
-            nn.Conv2d(64, 128, 4, 2, 1),
-            nn.BatchNorm2d(128),
-            nn.LeakyReLU(0.2),
-            nn.Conv2d(128, 256, 4, 2, 1),
-            nn.BatchNorm2d(256),
-            nn.LeakyReLU(0.2),
-            nn.Conv2d(256, 512, 4, 2, 1),
-            nn.BatchNorm2d(512),
-            nn.LeakyReLU(0.2),
-        )
-        
-        # Temporal ConvLSTM
-        self.convlstm = ConvLSTM(512, 512, kernel_size=3, num_layers=2)
-        
-        # Vision Transformer pour capturer les dépendances globales
-        self.patch_size = 16
-        self.num_patches = (config.IMG_SIZE[0] // 16) * (config.IMG_SIZE[1] // 16)
-        
-        self.patch_embed = nn.Sequential(
-            Rearrange('b c (h p1) (w p2) -> b (h w) (p1 p2 c)', 
-                     p1=self.patch_size, p2=self.patch_size),
-            nn.Linear(self.patch_size * self.patch_size * 512, config.VIT_DIM)
-        )
-        
-        self.pos_embedding = nn.Parameter(torch.randn(1, self.num_patches, config.VIT_DIM))
-        
-        self.transformer_blocks = nn.ModuleList([
-            TransformerBlock(
-                config.VIT_DIM, 
-                config.VIT_HEADS, 
-                config.VIT_DIM // config.VIT_HEADS,
-                config.VIT_MLP_DIM
-            ) for _ in range(config.VIT_DEPTH)
-        ])
-        
-        self.norm = nn.LayerNorm(config.VIT_DIM)
-        
-        # Unpatch
-        self.unpatch = nn.Sequential(
-            nn.Linear(config.VIT_DIM, self.patch_size * self.patch_size * 512),
-            Rearrange('b (h w) (p1 p2 c) -> b c (h p1) (w p2)',
-                     h=config.IMG_SIZE[0]//self.patch_size,
-                     w=config.IMG_SIZE[1]//self.patch_size,
-                     p1=self.patch_size, p2=self.patch_size)
-        )
-        
-        # Decoder avec skip connections
-        self.decoder = nn.Sequential(
-            nn.ConvTranspose2d(512, 256, 4, 2, 1),
-            nn.BatchNorm2d(256),
-            nn.ReLU(),
-            nn.ConvTranspose2d(256, 128, 4, 2, 1),
-            nn.BatchNorm2d(128),
-            nn.ReLU(),
-            nn.ConvTranspose2d(128, 64, 4, 2, 1),
-            nn.BatchNorm2d(64),
-            nn.ReLU(),
-            nn.ConvTranspose2d(64, 32, 4, 2, 1),
-            nn.BatchNorm2d(32),
-            nn.ReLU(),
-            nn.Conv2d(32, 3, 3, 1, 1),
-            nn.Tanh()
-        )
-    
-    def forward(self, x):
-        batch_size, seq_len, c, h, w = x.size()
-        
-        # Encoder chaque frame
-        encoded_frames = []
-        for t in range(seq_len):
-            encoded = self.encoder(x[:, t])
-            encoded_frames.append(encoded)
-        
-        # Stack pour ConvLSTM
-        encoded_sequence = torch.stack(encoded_frames, dim=1)
-        
-        # Process avec ConvLSTM
-        lstm_out, _ = self.convlstm(encoded_sequence)
-        last_hidden = lstm_out[:, -1]  # Prendre la dernière sortie
-        
-        # Vision Transformer pour améliorer les features
-        # Reshape pour patches
-        b, c, h_feat, w_feat = last_hidden.shape
-        
-        # Si les dimensions ne correspondent pas, ajuster
-        if h_feat * w_feat != self.num_patches:
-            # Redimensionner pour correspondre aux patches attendus
-            last_hidden = F.interpolate(last_hidden, size=(16, 16), mode='bilinear')
-        
-        # Patch embedding
-        patches = self.patch_embed(last_hidden)
-        patches = patches + self.pos_embedding
-        
-        # Transformer blocks
-        for transformer in self.transformer_blocks:
-            patches = transformer(patches)
-        
-        patches = self.norm(patches)
-        
-        # Unpatch
-        features = self.unpatch(patches)
-        
-        # Decoder
-        output = self.decoder(features)
-        
-        return output
-
-# ==================== ConvLSTM Implementation ====================
+# ==================== ConvLSTM ====================
 class ConvLSTMCell(nn.Module):
     def __init__(self, input_dim, hidden_dim, kernel_size, bias=True):
         super().__init__()
@@ -349,7 +266,6 @@ class ConvLSTM(nn.Module):
     def forward(self, x):
         batch_size, seq_len, channels, height, width = x.size()
         
-        # Initialize hidden states
         h = [None] * self.num_layers
         c = [None] * self.num_layers
         
@@ -379,10 +295,121 @@ class ConvLSTM(nn.Module):
         
         return torch.stack(outputs, dim=1), (h, c)
 
+# ==================== Generator ====================
+class HybridGenerator(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.config = config
+        
+        # Encoder
+        self.encoder = nn.Sequential(
+            nn.Conv2d(3, 64, 4, 2, 1),
+            nn.BatchNorm2d(64),
+            nn.LeakyReLU(0.2),
+            nn.Conv2d(64, 128, 4, 2, 1),
+            nn.BatchNorm2d(128),
+            nn.LeakyReLU(0.2),
+            nn.Conv2d(128, 256, 4, 2, 1),
+            nn.BatchNorm2d(256),
+            nn.LeakyReLU(0.2),
+            nn.Conv2d(256, 512, 4, 2, 1),
+            nn.BatchNorm2d(512),
+            nn.LeakyReLU(0.2),
+        )
+        
+        # ConvLSTM
+        self.convlstm = ConvLSTM(512, 512, kernel_size=3, num_layers=2)
+        
+        # Vision Transformer
+        self.patch_size = 16
+        self.num_patches = (config.IMG_SIZE[0] // 16) * (config.IMG_SIZE[1] // 16)
+        
+        self.patch_embed = nn.Sequential(
+            Rearrange('b c (h p1) (w p2) -> b (h w) (p1 p2 c)', 
+                     p1=self.patch_size, p2=self.patch_size),
+            nn.Linear(self.patch_size * self.patch_size * 512, config.VIT_DIM)
+        )
+        
+        self.pos_embedding = nn.Parameter(torch.randn(1, self.num_patches, config.VIT_DIM))
+        
+        self.transformer_blocks = nn.ModuleList([
+            TransformerBlock(
+                config.VIT_DIM, 
+                config.VIT_HEADS, 
+                config.VIT_DIM // config.VIT_HEADS,
+                config.VIT_MLP_DIM
+            ) for _ in range(6)  # Réduire la profondeur pour économiser la mémoire
+        ])
+        
+        self.norm = nn.LayerNorm(config.VIT_DIM)
+        
+        # Unpatch
+        self.unpatch = nn.Sequential(
+            nn.Linear(config.VIT_DIM, self.patch_size * self.patch_size * 512),
+            Rearrange('b (h w) (p1 p2 c) -> b c (h p1) (w p2)',
+                     h=config.IMG_SIZE[0]//self.patch_size,
+                     w=config.IMG_SIZE[1]//self.patch_size,
+                     p1=self.patch_size, p2=self.patch_size)
+        )
+        
+        # Decoder
+        self.decoder = nn.Sequential(
+            nn.ConvTranspose2d(512, 256, 4, 2, 1),
+            nn.BatchNorm2d(256),
+            nn.ReLU(),
+            nn.ConvTranspose2d(256, 128, 4, 2, 1),
+            nn.BatchNorm2d(128),
+            nn.ReLU(),
+            nn.ConvTranspose2d(128, 64, 4, 2, 1),
+            nn.BatchNorm2d(64),
+            nn.ReLU(),
+            nn.ConvTranspose2d(64, 32, 4, 2, 1),
+            nn.BatchNorm2d(32),
+            nn.ReLU(),
+            nn.Conv2d(32, 3, 3, 1, 1),
+            nn.Tanh()
+        )
+    
+    def forward(self, x):
+        batch_size, seq_len, c, h, w = x.size()
+        
+        # Encoder
+        encoded_frames = []
+        for t in range(seq_len):
+            encoded = self.encoder(x[:, t])
+            encoded_frames.append(encoded)
+        
+        # ConvLSTM
+        encoded_sequence = torch.stack(encoded_frames, dim=1)
+        lstm_out, _ = self.convlstm(encoded_sequence)
+        last_hidden = lstm_out[:, -1]
+        
+        # Vision Transformer
+        b, c, h_feat, w_feat = last_hidden.shape
+        
+        # Ajuster si nécessaire
+        if h_feat * w_feat != self.num_patches:
+            import torch.nn.functional as F
+            last_hidden = F.interpolate(last_hidden, size=(16, 16), mode='bilinear')
+        
+        # Patches
+        patches = self.patch_embed(last_hidden)
+        patches = patches + self.pos_embedding
+        
+        # Transformer
+        for transformer in self.transformer_blocks:
+            patches = transformer(patches)
+        
+        patches = self.norm(patches)
+        
+        # Unpatch et decoder
+        features = self.unpatch(patches)
+        output = self.decoder(features)
+        
+        return output
+
 # ==================== Discriminator ====================
 class PatchGANDiscriminator(nn.Module):
-    """PatchGAN Discriminator pour juger le réalisme local"""
-    
     def __init__(self, input_channels=3):
         super().__init__()
         
@@ -394,36 +421,31 @@ class PatchGANDiscriminator(nn.Module):
             return layers
         
         self.model = nn.Sequential(
-            *discriminator_block(input_channels * 2, 64, normalize=False),  # x2 pour input+target
+            *discriminator_block(input_channels * 2, 64, normalize=False),
             *discriminator_block(64, 128),
             *discriminator_block(128, 256),
             *discriminator_block(256, 512, stride=1),
-            nn.Conv2d(512, 1, 4, padding=1)  # PatchGAN output
+            nn.Conv2d(512, 1, 4, padding=1)
         )
     
     def forward(self, input_sequence, target):
-        # Prendre la dernière frame de la séquence comme référence
         last_frame = input_sequence[:, -1] if len(input_sequence.shape) == 5 else input_sequence
-        
-        # Concatener avec la cible
         combined = torch.cat([last_frame, target], dim=1)
         output = self.model(combined)
         return output
 
 # ==================== Loss Functions ====================
 class PerceptualLoss(nn.Module):
-    """Loss perceptuelle utilisant VGG"""
-    
     def __init__(self, device):
         super().__init__()
         vgg = models.vgg19(pretrained=True).features.to(device).eval()
         
         self.blocks = nn.ModuleList([
-            vgg[:4],   # relu1_2
-            vgg[4:9],  # relu2_2
-            vgg[9:18], # relu3_4
-            vgg[18:27],# relu4_4
-            vgg[27:36] # relu5_4
+            vgg[:4],
+            vgg[4:9],
+            vgg[9:18],
+            vgg[18:27],
+            vgg[27:36]
         ])
         
         for p in self.parameters():
@@ -437,32 +459,11 @@ class PerceptualLoss(nn.Module):
         for i, block in enumerate(self.blocks):
             x = block(x)
             y = block(y)
-            loss += self.weights[i] * F.l1_loss(x, y)
+            loss += self.weights[i] * torch.nn.functional.l1_loss(x, y)
         
         return loss
 
-class TemporalConsistencyLoss(nn.Module):
-    """Loss pour la cohérence temporelle"""
-    
-    def __init__(self):
-        super().__init__()
-    
-    def forward(self, frames_sequence):
-        """
-        Calcule la cohérence temporelle entre frames consécutives
-        """
-        if len(frames_sequence) < 2:
-            return torch.tensor(0.0, device=frames_sequence.device)
-        
-        loss = 0.0
-        for i in range(len(frames_sequence) - 1):
-            # Optical flow approximation
-            diff = frames_sequence[i+1] - frames_sequence[i]
-            loss += torch.mean(torch.abs(diff))
-        
-        return loss / (len(frames_sequence) - 1)
-
-# ==================== Enhanced Trainer avec GAN ====================
+# ==================== Trainer ====================
 class GANTrainer:
     def __init__(self, generator, discriminator, config):
         self.generator = generator.to(config.DEVICE)
@@ -485,7 +486,6 @@ class GANTrainer:
         self.criterion_GAN = nn.BCEWithLogitsLoss()
         self.criterion_L1 = nn.L1Loss()
         self.perceptual_loss = PerceptualLoss(config.DEVICE)
-        self.temporal_loss = TemporalConsistencyLoss()
         
         # LPIPS
         self.lpips_loss = lpips.LPIPS(net='alex').to(config.DEVICE)
@@ -502,21 +502,23 @@ class GANTrainer:
         )
         
         # Metrics
-        self.g_losses = []
-        self.d_losses = []
+        self.metrics = {
+            'g_losses': [],
+            'd_losses': [],
+            'val_losses': []
+        }
         
         os.makedirs(config.CHECKPOINT_DIR, exist_ok=True)
         os.makedirs(config.OUTPUT_DIR, exist_ok=True)
     
     def train_discriminator(self, real_batch, fake_batch):
-        """Entraîner le discriminateur"""
         self.optimizer_D.zero_grad()
         
         batch_size = real_batch.size(0)
         
-        # Labels
-        real_labels = torch.ones(batch_size, 1, 30, 30).to(self.config.DEVICE) * 0.9  # Label smoothing
-        fake_labels = torch.zeros(batch_size, 1, 30, 30).to(self.config.DEVICE) + 0.1
+        # Labels avec label smoothing
+        real_labels = torch.ones_like(self.discriminator(fake_batch, real_batch)) * 0.9
+        fake_labels = torch.zeros_like(self.discriminator(fake_batch, fake_batch)) + 0.1
         
         with autocast(enabled=self.config.USE_MIXED_PRECISION):
             # Real loss
@@ -540,12 +542,8 @@ class GANTrainer:
         return d_loss.item()
     
     def train_generator(self, input_frames, target_frame, accumulation_step):
-        """Entraîner le générateur avec gradient accumulation"""
-        
-        batch_size = target_frame.size(0)
-        
         with autocast(enabled=self.config.USE_MIXED_PRECISION):
-            # Forward pass
+            # Generate
             generated_frame = self.generator(input_frames)
             
             # Adversarial loss
@@ -562,16 +560,12 @@ class GANTrainer:
             # LPIPS loss
             lpips_val = self.lpips_loss(generated_frame, target_frame).mean()
             
-            # Temporal consistency (si on a plusieurs frames générées)
-            temp_loss = torch.tensor(0.0).to(self.config.DEVICE)
-            
             # Total loss
             g_loss = (
                 self.config.GAN_WEIGHT * gan_loss +
                 self.config.L1_WEIGHT * l1_loss +
                 self.config.PERCEPTUAL_WEIGHT * perc_loss +
-                10.0 * lpips_val +
-                self.config.TEMPORAL_WEIGHT * temp_loss
+                10.0 * lpips_val
             ) / self.config.GRADIENT_ACCUMULATION_STEPS
         
         if self.scaler:
@@ -606,7 +600,6 @@ class GANTrainer:
         }
     
     def train_epoch(self, dataloader, epoch):
-        """Entraîner une epoch complète"""
         self.generator.train()
         self.discriminator.train()
         
@@ -619,7 +612,8 @@ class GANTrainer:
                 target_frame = target_frame.to(self.config.DEVICE)
                 
                 # Train Discriminator
-                if batch_idx % 2 == 0:  # Train D every 2 iterations
+                d_loss = 0
+                if batch_idx % 2 == 0:
                     with torch.no_grad():
                         fake_frame = self.generator(input_frames)
                     
@@ -632,20 +626,18 @@ class GANTrainer:
                 
                 # Update progress bar
                 pbar.set_postfix({
-                    'G_Loss': f"{g_losses['total']:.4f}",
-                    'D_Loss': f"{d_loss:.4f}" if batch_idx % 2 == 0 else "N/A",
-                    'L1': f"{g_losses['l1']:.4f}",
-                    'LPIPS': f"{g_losses['lpips']:.4f}"
+                    'G': f"{g_losses['total']:.4f}",
+                    'D': f"{d_loss:.4f}" if d_loss > 0 else "N/A",
+                    'L1': f"{g_losses['l1']:.4f}"
                 })
         
         # Update schedulers
         self.scheduler_G.step()
         self.scheduler_D.step()
         
-        return epoch_g_loss / len(dataloader), epoch_d_loss / (len(dataloader) // 2)
+        return epoch_g_loss / len(dataloader), epoch_d_loss / max(1, len(dataloader) // 2)
     
     def validate(self, dataloader):
-        """Validation"""
         self.generator.eval()
         val_loss = 0
         
@@ -661,7 +653,6 @@ class GANTrainer:
         return val_loss / len(dataloader)
     
     def save_checkpoint(self, epoch, g_loss, d_loss):
-        """Sauvegarder checkpoint"""
         checkpoint = {
             'epoch': epoch,
             'generator_state_dict': self.generator.state_dict(),
@@ -670,8 +661,7 @@ class GANTrainer:
             'optimizer_D_state_dict': self.optimizer_D.state_dict(),
             'g_loss': g_loss,
             'd_loss': d_loss,
-            'g_losses': self.g_losses,
-            'd_losses': self.d_losses
+            'metrics': self.metrics
         }
         
         checkpoint_path = os.path.join(
@@ -682,7 +672,6 @@ class GANTrainer:
         print(f"✅ Checkpoint sauvegardé: {checkpoint_path}")
     
     def visualize_results(self, dataloader, epoch):
-        """Visualiser les résultats"""
         self.generator.eval()
         
         with torch.no_grad():
@@ -692,44 +681,22 @@ class GANTrainer:
             
             generated_frame = self.generator(input_frames)
             
-            # Denormalize
-            def denorm(x):
-                return (x + 1) / 2
-            
-            # Convert to numpy
-            input_last = denorm(input_frames[0, -1]).cpu().numpy().transpose(1, 2, 0)
-            target = denorm(target_frame[0]).cpu().numpy().transpose(1, 2, 0)
-            generated = denorm(generated_frame[0]).cpu().numpy().transpose(1, 2, 0)
-            
-            # Create figure
-            fig, axes = plt.subplots(1, 3, figsize=(15, 5))
-            
-            axes[0].imshow(np.clip(input_last, 0, 1))
-            axes[0].set_title("Dernière frame d'entrée")
-            axes[0].axis('off')
-            
-            axes[1].imshow(np.clip(target, 0, 1))
-            axes[1].set_title("Frame cible")
-            axes[1].axis('off')
-            
-            axes[2].imshow(np.clip(generated, 0, 1))
-            axes[2].set_title("Frame générée")
-            axes[2].axis('off')
-            
-            plt.suptitle(f"Epoch {epoch + 1}")
-            plt.tight_layout()
+            # Sauvegarder avec OpenCV
+            images = [
+                input_frames[0, -1],
+                target_frame[0],
+                generated_frame[0]
+            ]
+            titles = ["Input", "Target", "Generated"]
             
             save_path = os.path.join(
                 self.config.OUTPUT_DIR,
                 f'prediction_epoch_{epoch+1}.png'
             )
-            plt.savefig(save_path, dpi=150, bbox_inches='tight')
-            plt.close()
             
-            print(f"📸 Visualisation sauvegardée: {save_path}")
+            save_image_grid(images, save_path, titles)
     
     def train(self, train_loader, val_loader=None):
-        """Entraînement complet"""
         print(f"🚀 Début de l'entraînement GAN sur {self.config.DEVICE}")
         print(f"📊 Mixed Precision: {self.config.USE_MIXED_PRECISION}")
         print(f"📊 Gradient Accumulation Steps: {self.config.GRADIENT_ACCUMULATION_STEPS}")
@@ -743,8 +710,8 @@ class GANTrainer:
             
             # Training
             g_loss, d_loss = self.train_epoch(train_loader, epoch)
-            self.g_losses.append(g_loss)
-            self.d_losses.append(d_loss)
+            self.metrics['g_losses'].append(g_loss)
+            self.metrics['d_losses'].append(d_loss)
             
             print(f"📉 Generator Loss: {g_loss:.4f}")
             print(f"📉 Discriminator Loss: {d_loss:.4f}")
@@ -752,6 +719,7 @@ class GANTrainer:
             # Validation
             if val_loader:
                 val_loss = self.validate(val_loader)
+                self.metrics['val_losses'].append(val_loss)
                 print(f"📈 Validation Loss: {val_loss:.4f}")
                 
                 if val_loss < best_val_loss:
@@ -762,13 +730,20 @@ class GANTrainer:
             if (epoch + 1) % 5 == 0:
                 self.visualize_results(train_loader, epoch)
             
+            # Save metrics
+            if (epoch + 1) % 10 == 0:
+                metrics_path = os.path.join(
+                    self.config.OUTPUT_DIR,
+                    'training_metrics.json'
+                )
+                save_training_metrics(self.metrics, metrics_path)
+            
             # Save periodic checkpoint
             if (epoch + 1) % 20 == 0:
                 self.save_checkpoint(epoch, g_loss, d_loss)
 
-# ==================== Main Function ====================
+# ==================== Main ====================
 def main():
-    # Configuration
     config = Config()
     
     print("🎨 Animation Frame Prediction avec GAN + Vision Transformer")
@@ -792,7 +767,7 @@ def main():
         augment=False
     )
     
-    # Split dataset
+    # Split
     train_size = int(0.8 * len(train_dataset))
     val_size = len(train_dataset) - train_size
     
@@ -807,7 +782,7 @@ def main():
         train_subset,
         batch_size=config.BATCH_SIZE,
         shuffle=True,
-        num_workers=4,
+        num_workers=2,
         pin_memory=True
     )
     
@@ -815,7 +790,7 @@ def main():
         val_subset,
         batch_size=config.BATCH_SIZE,
         shuffle=False,
-        num_workers=4,
+        num_workers=2,
         pin_memory=True
     )
     
@@ -839,32 +814,6 @@ def main():
     trainer.train(train_loader, val_loader)
     
     print("\n✅ Entraînement terminé!")
-    
-    # Plot training curves
-    plt.figure(figsize=(12, 5))
-    
-    plt.subplot(1, 2, 1)
-    plt.plot(trainer.g_losses, label='Generator Loss')
-    plt.xlabel('Epoch')
-    plt.ylabel('Loss')
-    plt.title('Generator Training')
-    plt.legend()
-    plt.grid(True)
-    
-    plt.subplot(1, 2, 2)
-    plt.plot(trainer.d_losses, label='Discriminator Loss')
-    plt.xlabel('Epoch')
-    plt.ylabel('Loss')
-    plt.title('Discriminator Training')
-    plt.legend()
-    plt.grid(True)
-    
-    plt.tight_layout()
-    plt.savefig('training_curves_gan.png')
-    plt.show()
-
-# ==================== Utility Functions ====================
-import torch.nn.functional as F
 
 def extract_frames_from_video(video_path, output_dir, skip_frames=1, max_frames=None):
     """Extraire les frames d'une vidéo"""
@@ -895,8 +844,8 @@ def extract_frames_from_video(video_path, output_dir, skip_frames=1, max_frames=
     print(f"✅ {saved_count} frames extraites vers {output_dir}")
 
 if __name__ == "__main__":
-    # Option 1: Extraire les frames
+    # Extraction des frames (décommenter si nécessaire)
     # extract_frames_from_video('anime_video.mp4', 'anime_frames', skip_frames=2, max_frames=1000)
     
-    # Option 2: Entraîner le modèle
+    # Entraînement
     main()

@@ -11,7 +11,7 @@ from PIL import Image
 from torchvision import transforms
 import matplotlib.pyplot as plt
 
-# --- 1. Chargement des Données (MODIFIÉ pour les séquences) ---
+# --- 1. Chargement des Données ---
 
 class AnimeFrameSequenceDataset(Dataset):
     """Dataset pour charger les séquences de frames (T-1, T) -> (T+1)."""
@@ -29,7 +29,6 @@ class AnimeFrameSequenceDataset(Dataset):
     def __len__(self) -> int:
         return len(self.files) - 2
 
-    # MODIFICATION 1 : La fonction retourne maintenant les noms de fichiers
     def __getitem__(self, idx: int) -> tuple[torch.Tensor, torch.Tensor, tuple[str, str]]:
         img_path1 = self.files[idx]
         img_path2 = self.files[idx + 1]
@@ -44,13 +43,11 @@ class AnimeFrameSequenceDataset(Dataset):
         target = self.transform(image3)
         
         input_tensor = torch.cat([tensor1, tensor2], dim=0)
-        
-        # On retourne aussi les noms de fichiers pour l'affichage
         filenames = (img_path1.name, img_path2.name)
         
         return input_tensor, target, filenames
 
-# --- 2. Architecture du Modèle U-Net (inchangé) ---
+# --- 2. Architecture du Modèle U-Net ---
 
 class UNet(nn.Module):
     """Architecture U-Net simplifiée pour la prédiction d'images."""
@@ -94,40 +91,38 @@ class UNet(nn.Module):
         out = self.final_conv(d1)
         return torch.sigmoid(out)
 
-# --- 3. Boucle d'Entraînement et Visualisation (MODIFIÉ) ---
+# --- 3. Boucle d'Entraînement et Visualisation ---
 
-# MODIFICATION 2 : La fonction de sauvegarde utilise les noms de fichiers
 def save_prediction_examples(model, loader, device, epoch, output_dir="outputs_sequence"):
     """Sauvegarde quelques exemples de prédictions."""
     model.eval()
     Path(output_dir).mkdir(exist_ok=True)
     
-    # On récupère maintenant les 'filenames' en plus des tenseurs
     inputs, targets, filenames = next(iter(loader))
     inputs, targets = inputs.to(device), targets.to(device)
     
     with torch.no_grad():
         preds = model(inputs)
 
-    fig, axes = plt.subplots(3, 4, figsize=(12, 9))
+    # MODIFIÉ : La grille a maintenant 3 colonnes au lieu de 4
+    fig, axes = plt.subplots(3, 3, figsize=(9, 9))
     fig.suptitle(f"Prédictions à l'Époque {epoch}", fontsize=16)
 
     for i in range(min(3, inputs.size(0))):
         input_frame_1 = inputs[i][:3].cpu().permute(1, 2, 0)
         input_frame_2 = inputs[i][3:].cpu().permute(1, 2, 0)
         
-        # On utilise les noms de fichiers récupérés pour les titres
+        # Colonne 1 : Première image d'entrée
         axes[i, 0].imshow(input_frame_1)
         axes[i, 0].set_title(f"{filenames[0][i]}")
         
+        # Colonne 2 : Deuxième image d'entrée
         axes[i, 1].imshow(input_frame_2)
         axes[i, 1].set_title(f"{filenames[1][i]}")
         
-        axes[i, 2].imshow(targets[i].cpu().permute(1, 2, 0))
-        axes[i, 2].set_title("(Validation)") # Titre fixe comme demandé
-        
-        axes[i, 3].imshow(preds[i].cpu().permute(1, 2, 0))
-        axes[i, 3].set_title("Prédite") # Titre fixe comme demandé
+        # Colonne 3 : L'image prédite par le modèle
+        axes[i, 2].imshow(preds[i].cpu().permute(1, 2, 0))
+        axes[i, 2].set_title("Prédiction")
         
         for ax in axes[i]:
             ax.axis("off")
@@ -153,8 +148,8 @@ def train(args: argparse.Namespace):
     for epoch in range(args.epochs):
         model.train()
         total_loss = 0.0
-        # La boucle d'entraînement doit ignorer les noms de fichiers
-        for inputs, targets, _ in loader: # On utilise '_' pour ignorer les noms ici
+        # On a toujours besoin de 'targets' ici pour calculer la perte (loss)
+        for inputs, targets, _ in loader:
             inputs, targets = inputs.to(device), targets.to(device)
             
             optimizer.zero_grad()

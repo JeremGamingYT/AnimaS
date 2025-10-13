@@ -633,7 +633,7 @@ def psnr_value(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
 class AEConfig:
     image_size: int = 128
     in_channels: int = 3
-    base_channels: int = 64
+    base_channels: int = 96
     bottleneck_channels: int = 512
 
 
@@ -1882,7 +1882,7 @@ def train_editor_from_ae(
     batch_size: int = 8,
     epochs: int = 8,
     lr: float = 1e-4,
-    base_channels: int = 64,
+    base_channels: int = 96,
     bottleneck_channels: int = 512,
     device: str = "cuda",
 ) -> str:

@@ -1206,14 +1206,20 @@ def train_predictor_ae(
     ds = FramePairDataset(root=data_root, image_size=image_size, is_train=True)
     dl = DataLoader(ds, batch_size=batch_size, shuffle=True, num_workers=4, pin_memory=True)
 
-    # Initialize from AE weights
+    # Initialize from AE weights and keep AE as a frozen teacher for consistency loss
     ckpt = torch.load(ae_ckpt, map_location="cpu")
     ae_cfg = AEConfig(**ckpt["config"])  # type: ignore[arg-type]
     arch = ckpt.get("arch", "unet")
     translator = UNetTranslator(image_size=image_size, base_channels=base_channels, bottleneck_channels=bottleneck_channels).to(device_t)
     if arch == "unet":
         ae_model = UNetAutoencoder(ae_cfg)
-        ae_model.load_state_dict(ckpt["state_dict"])  # type: ignore[index]
+    else:
+        ae_model = ConvAutoencoder(ae_cfg)
+    ae_model.load_state_dict(ckpt["state_dict"])  # type: ignore[index]
+    ae_model = ae_model.to(device_t).eval()
+    for p in ae_model.parameters():
+        p.requires_grad = False
+    if arch == "unet":
         translator.init_from_unet_autoencoder(ae_model.state_dict())
 
     opt = torch.optim.AdamW(translator.parameters(), lr=lr, betas=(0.9, 0.95), weight_decay=0.01)
@@ -1227,15 +1233,28 @@ def train_predictor_ae(
             x_t = x_t.to(device_t, non_blocking=True)
             x_tp1 = x_tp1.to(device_t, non_blocking=True)
             last_batch = (x_t, x_tp1)
-            # concatenate x_t with itself as simple 6-channel input (placeholder for auxiliary)
-            y = translator(torch.cat([x_t, x_t], dim=1))
+            # Residual prediction: y = x_t + r
+            r = translator(torch.cat([x_t, x_t], dim=1))
+            y = torch.clamp(x_t + r, -1.0, 1.0)
+
+            # Dynamic mask from GT difference
+            with torch.no_grad():
+                diff = (x_tp1 - x_t).abs().mean(dim=1, keepdim=True)
+                dyn_mask = (diff > 0.02).float()
+            static_mask = 1.0 - dyn_mask
+
+            # Losses
             loss_rec = l1(y, x_tp1)
             loss_edge = sobel_edge_loss(y, x_tp1)
             loss_ssim = ssim_loss_simple(y, x_tp1)
-            # Encourage motion: penalize identical outputs to inputs inside random global mask
-            rand_mask = make_random_edit_mask(x_t.shape[2], x_t.shape[3]).to(device_t).unsqueeze(0).expand(x_t.shape[0], -1, -1, -1)
-            motion_penalty = F.l1_loss(y * rand_mask, x_t * rand_mask)
-            loss = loss_rec + 0.1 * loss_edge + 0.5 * loss_ssim + 0.1 * motion_penalty
+            loss_dyn = F.l1_loss(y * dyn_mask, x_tp1 * dyn_mask)
+            loss_static_id = F.l1_loss(y * static_mask, x_t * static_mask)
+            # AE consistency (teacher): outputs should reconstruct like target
+            with torch.no_grad():
+                rec_y = ae_model(y)
+                rec_t1 = ae_model(x_tp1)
+            loss_ae = l1(rec_y, rec_t1)
+            loss = loss_rec + 0.1 * loss_edge + 0.5 * loss_ssim + 0.5 * loss_dyn + 0.1 * loss_static_id + 0.1 * loss_ae
             opt.zero_grad(set_to_none=True)
             loss.backward()
             torch.nn.utils.clip_grad_norm_(translator.parameters(), 1.0)
@@ -1245,8 +1264,9 @@ def train_predictor_ae(
         if last_batch is not None:
             translator.eval()
             with torch.no_grad():
-                vis = translator(torch.cat([last_batch[0][:1], last_batch[0][:1]], dim=1))
-            save_image_grid(last_batch[0][:1], vis, Path("samples/predictor_ae"), f"epoch_{epoch:03d}.png")
+                r_vis = translator(torch.cat([last_batch[0][:1], last_batch[0][:1]], dim=1))
+                y_vis = torch.clamp(last_batch[0][:1] + r_vis, -1.0, 1.0)
+            save_image_grid(last_batch[0][:1], y_vis, Path("samples/predictor_ae"), f"epoch_{epoch:03d}.png")
             translator.train()
 
     out_path_p = Path(out_path)
@@ -1278,7 +1298,8 @@ def predict_next_ae(
         T.Normalize([0.5, 0.5, 0.5], [0.5, 0.5, 0.5]),
     ])
     x = tfm(img).unsqueeze(0).to(device_t)
-    y = translator(torch.cat([x, x], dim=1))
+    r = translator(torch.cat([x, x], dim=1))
+    y = torch.clamp(x + r, -1.0, 1.0)
     out_path_p = Path(out_path)
     out_path_p.parent.mkdir(parents=True, exist_ok=True)
     save_image_grid(x, y, out_path_p.parent, out_path_p.name)
@@ -1311,7 +1332,8 @@ def eval_next_ae(
         x_t = x_t.to(device_t)
         x_tp1 = x_tp1.to(device_t)
         with torch.no_grad():
-            y = translator(torch.cat([x_t, x_t], dim=1))
+            r = translator(torch.cat([x_t, x_t], dim=1))
+            y = torch.clamp(x_t + r, -1.0, 1.0)
         for i in range(x_t.shape[0]):
             psnr_vals.append(float(psnr_value(y[i:i+1], x_tp1[i:i+1]).item()))
             ssim_vals.append(float(ssim_value(y[i:i+1], x_tp1[i:i+1]).item()))

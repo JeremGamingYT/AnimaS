@@ -149,6 +149,9 @@ class HighQualityGenerator(nn.Module):
             batch_first=True
         )
         
+        # Projection layer pour adapter la sortie du LSTM aux dimensions nécessaires
+        self.temporal_projection = nn.Linear(2048, 512 * 16 * 16)
+        
         # ========== RECONSTRUCTION DECODER ==========
         # Pour reconstruire parfaitement l'image d'entrée
         self.reconstruction_decoder = nn.ModuleList([
@@ -293,8 +296,9 @@ class HighQualityGenerator(nn.Module):
         temporal_input = torch.stack(flattened_features, dim=1)
         temporal_output, _ = self.temporal_module(temporal_input)
         
-        # Prendre la dernière sortie temporelle
-        last_temporal = temporal_output[:, -1]
+        # Prendre la dernière sortie temporelle et projeter
+        last_temporal = temporal_output[:, -1]  # Shape: [batch_size, 2048]
+        last_temporal = self.temporal_projection(last_temporal)  # Shape: [batch_size, 512*16*16]
         last_temporal = last_temporal.view(batch_size, 512, 16, 16)
         
         # ========== PHASE 3: PREDICTION ==========

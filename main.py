@@ -433,6 +433,11 @@ class GPTConfig:
     num_layers: int = 6
     num_heads: int = 6
     dropout: float = 0.1
+    # Enhancements
+    use_pos2d: bool = False
+    max_h: int = 0
+    max_w: int = 0
+    tie_weights: bool = True
 
 
 class GPTNextFrame(nn.Module):
@@ -441,19 +446,28 @@ class GPTNextFrame(nn.Module):
         self.cfg = cfg
         self.token_embed = nn.Embedding(cfg.vocab_size, cfg.embed_dim)
         self.pos_embed = nn.Embedding(cfg.max_seq_len, cfg.embed_dim)
+        if cfg.use_pos2d:
+            # +1 to reserve 0 for special tokens (BOS/SEP)
+            self.row_embed = nn.Embedding(max(1, cfg.max_h + 1), cfg.embed_dim)
+            self.col_embed = nn.Embedding(max(1, cfg.max_w + 1), cfg.embed_dim)
         self.seg_embed = nn.Embedding(2, cfg.embed_dim)
         self.drop = nn.Dropout(cfg.dropout)
         self.blocks = nn.ModuleList([GPTBlock(cfg.embed_dim, cfg.num_heads, dropout=cfg.dropout) for _ in range(cfg.num_layers)])
         self.ln_f = nn.LayerNorm(cfg.embed_dim)
         self.head = nn.Linear(cfg.embed_dim, cfg.vocab_size, bias=False)
+        if cfg.tie_weights:
+            self.head.weight = self.token_embed.weight
 
-    def forward(self, input_ids: torch.Tensor, segment_ids: torch.Tensor) -> torch.Tensor:
+    def forward(self, input_ids: torch.Tensor, segment_ids: torch.Tensor, row_ids: Optional[torch.Tensor] = None, col_ids: Optional[torch.Tensor] = None) -> torch.Tensor:
         b, t = input_ids.shape
         device = input_ids.device
         if t > self.cfg.max_seq_len:
             raise ValueError(f"Sequence too long: {t} > max_seq_len={self.cfg.max_seq_len}")
-        pos_ids = torch.arange(t, device=device).unsqueeze(0).expand(b, -1)
-        x = self.token_embed(input_ids) + self.pos_embed(pos_ids) + self.seg_embed(segment_ids)
+        if self.cfg.use_pos2d and (row_ids is not None) and (col_ids is not None):
+            x = self.token_embed(input_ids) + self.row_embed(row_ids) + self.col_embed(col_ids) + self.seg_embed(segment_ids)
+        else:
+            pos_ids = torch.arange(t, device=device).unsqueeze(0).expand(b, -1)
+            x = self.token_embed(input_ids) + self.pos_embed(pos_ids) + self.seg_embed(segment_ids)
         x = self.drop(x)
         attn_mask = build_causal_mask(t, device)
         for blk in self.blocks:
@@ -463,13 +477,17 @@ class GPTNextFrame(nn.Module):
         return logits
 
     @torch.no_grad()
-    def generate(self, prefix_ids: torch.Tensor, prefix_segs: torch.Tensor, max_new_tokens: int, temperature: float = 1.0, top_k: Optional[int] = 50, forbidden_token_ids: Optional[Tuple[int, ...]] = None) -> torch.Tensor:
+    def generate(self, prefix_ids: torch.Tensor, prefix_segs: torch.Tensor, max_new_tokens: int, temperature: float = 1.0, top_k: Optional[int] = 50, top_p: Optional[float] = None, forbidden_token_ids: Optional[Tuple[int, ...]] = None, row_ids_full: Optional[torch.Tensor] = None, col_ids_full: Optional[torch.Tensor] = None) -> torch.Tensor:
         self.eval()
         generated = prefix_ids
         generated_segs = prefix_segs
         device = prefix_ids.device
         for _ in range(max_new_tokens):
-            logits = self.forward(generated, generated_segs)
+            if (row_ids_full is not None) and (col_ids_full is not None):
+                cur_len = generated.shape[1]
+                logits = self.forward(generated, generated_segs, row_ids=row_ids_full[:, :cur_len], col_ids=col_ids_full[:, :cur_len])
+            else:
+                logits = self.forward(generated, generated_segs)
             next_token_logits = logits[:, -1, :] / max(1e-6, temperature)
             if forbidden_token_ids is not None:
                 next_token_logits[:, list(forbidden_token_ids)] = float("-inf")
@@ -477,6 +495,16 @@ class GPTNextFrame(nn.Module):
                 topk_vals, topk_idx = torch.topk(next_token_logits, k=min(top_k, next_token_logits.shape[-1]))
                 filtered = torch.full_like(next_token_logits, float("-inf"))
                 filtered.scatter_(1, topk_idx, topk_vals)
+                next_token_logits = filtered
+            if top_p is not None and top_p > 0.0 and top_p < 1.0:
+                sorted_logits, sorted_idx = torch.sort(next_token_logits, descending=True, dim=-1)
+                cumprobs = torch.cumsum(F.softmax(sorted_logits, dim=-1), dim=-1)
+                cutoff = (cumprobs > top_p).float().argmax(dim=-1, keepdim=True)
+                mask = torch.ones_like(sorted_logits, dtype=torch.bool)
+                b_idx = torch.arange(sorted_logits.size(0), device=device).unsqueeze(-1)
+                mask[b_idx, cutoff:] = False
+                filtered = torch.full_like(next_token_logits, float("-inf"))
+                filtered.scatter_(1, sorted_idx[mask].view(next_token_logits.size(0), -1), sorted_logits[mask].view(next_token_logits.size(0), -1))
                 next_token_logits = filtered
             probs = F.softmax(next_token_logits, dim=-1)
             next_token = torch.multinomial(probs, num_samples=1)
@@ -1000,11 +1028,31 @@ def train_gpt_next(data_root: str, vqvae_ckpt: str, out_path: str, image_size: i
     sep_id = num_embeddings + 1
     vocab_size = num_embeddings + 2
     max_seq_len = 1 + tokens_per_frame + 1 + tokens_per_frame
-    gptcfg = GPTConfig(vocab_size=vocab_size, max_seq_len=max_seq_len, embed_dim=embed_dim, num_layers=layers, num_heads=heads, dropout=0.1)
+    gptcfg = GPTConfig(
+        vocab_size=vocab_size,
+        max_seq_len=max_seq_len,
+        embed_dim=embed_dim,
+        num_layers=layers,
+        num_heads=heads,
+        dropout=0.1,
+        use_pos2d=True,
+        max_h=h_code,
+        max_w=w_code,
+        tie_weights=True,
+    )
     gpt = GPTNextFrame(gptcfg).to(device_t)
 
     scaler = torch.amp.GradScaler(device_t.type)
     opt = torch.optim.AdamW(gpt.parameters(), lr=lr, betas=(0.9, 0.95), weight_decay=0.01)
+    # Warmup + cosine scheduler
+    total_steps = max(1, epochs * (len(dl)))
+    warmup_steps = max(1, int(0.1 * total_steps))
+    def lr_lambda(step: int) -> float:
+        if step < warmup_steps:
+            return float(step + 1) / float(warmup_steps)
+        progress = float(step - warmup_steps) / float(max(1, total_steps - warmup_steps))
+        return 0.5 * (1.0 + math.cos(math.pi * progress))
+    scheduler = torch.optim.lr_scheduler.LambdaLR(opt, lr_lambda)
     ce_loss = nn.CrossEntropyLoss(ignore_index=-100)
 
     last_batch = None
@@ -1029,8 +1077,29 @@ def train_gpt_next(data_root: str, vqvae_ckpt: str, out_path: str, image_size: i
             seg_next = torch.ones((b, 1 + tokens_per_frame - 1), dtype=torch.long, device=device_t)
             segment_ids = torch.cat([seg_prev, seg_next], dim=1)
 
+            # Build 2D positions for the whole sequence (BOS + prev + SEP + tgt[:-1])
+            # We set row/col=0 for BOS/SEP, and (1..h_code)/(1..w_code) for tokens
+            rows = torch.zeros_like(input_ids)
+            cols = torch.zeros_like(input_ids)
+            start = 1  # skip BOS
+            # prev_tokens positions
+            rc = torch.arange(tokens_per_frame, device=device_t)
+            r = (rc // w_code) + 1
+            c = (rc % w_code) + 1
+            rows[:, start:start+tokens_per_frame] = r.view(1, -1).expand(b, -1)
+            cols[:, start:start+tokens_per_frame] = c.view(1, -1).expand(b, -1)
+            start += tokens_per_frame
+            # SEP stays 0
+            start += 1
+            # target[:-1] positions
+            rc2 = torch.arange(tokens_per_frame - 1, device=device_t)
+            r2 = (rc2 // w_code) + 1
+            c2 = (rc2 % w_code) + 1
+            rows[:, start:start+tokens_per_frame-1] = r2.view(1, -1).expand(b, -1)
+            cols[:, start:start+tokens_per_frame-1] = c2.view(1, -1).expand(b, -1)
+
             with torch.amp.autocast(device_type=device_t.type, enabled=True):
-                logits = gpt(input_ids=input_ids, segment_ids=segment_ids)
+                logits = gpt(input_ids=input_ids, segment_ids=segment_ids, row_ids=rows, col_ids=cols)
                 targets = torch.full_like(input_ids, fill_value=-100)
                 targets[:, -tokens_per_frame:] = next_tokens
                 loss = ce_loss(logits.view(-1, logits.size(-1)), targets.view(-1))
@@ -1041,6 +1110,7 @@ def train_gpt_next(data_root: str, vqvae_ckpt: str, out_path: str, image_size: i
             torch.nn.utils.clip_grad_norm_(gpt.parameters(), 1.0)
             scaler.step(opt)
             scaler.update()
+            scheduler.step()
             pbar.set_postfix({"loss": float(loss)})
 
         # Qualitative sample
@@ -1056,7 +1126,23 @@ def train_gpt_next(data_root: str, vqvae_ckpt: str, out_path: str, image_size: i
                 seg_prev = torch.zeros((1, 1 + prev_tokens.shape[1]), dtype=torch.long, device=device_t)
                 seg_sep = torch.ones((1, 1), dtype=torch.long, device=device_t)
                 prefix_segs = torch.cat([seg_prev, seg_sep], dim=1)
-                generated = gpt.generate(prefix_ids, prefix_segs, max_new_tokens=tokens_per_frame, temperature=0.9, top_k=50, forbidden_token_ids=(bos_id, sep_id))
+                # Prepare full row/col ids for prefix + generation
+                total_len = int(prefix_ids.shape[1] + tokens_per_frame)
+                rows_full = torch.zeros((1, total_len), dtype=torch.long, device=device_t)
+                cols_full = torch.zeros((1, total_len), dtype=torch.long, device=device_t)
+                # fill prev positions
+                rc = torch.arange(tokens_per_frame, device=device_t)
+                r = (rc // w_code) + 1
+                c = (rc % w_code) + 1
+                rows_full[:, 1:1+tokens_per_frame] = r.view(1, -1)
+                cols_full[:, 1:1+tokens_per_frame] = c.view(1, -1)
+                # future tokens positions
+                rc2 = torch.arange(tokens_per_frame, device=device_t)
+                r2 = (rc2 // w_code) + 1
+                c2 = (rc2 % w_code) + 1
+                rows_full[:, prefix_ids.shape[1]:] = r2.view(1, -1)
+                cols_full[:, prefix_ids.shape[1]:] = c2.view(1, -1)
+                generated = gpt.generate(prefix_ids, prefix_segs, max_new_tokens=tokens_per_frame, temperature=0.9, top_k=50, top_p=None, forbidden_token_ids=(bos_id, sep_id), row_ids_full=rows_full, col_ids_full=cols_full)
                 next_tokens = generated[:, -tokens_per_frame:]
                 tokens_reshaped = next_tokens.view(1, h_code, w_code)
                 x_rec = vqvae.decode_from_indices(tokens_reshaped)
@@ -1064,7 +1150,16 @@ def train_gpt_next(data_root: str, vqvae_ckpt: str, out_path: str, image_size: i
 
     out_path_p = Path(out_path)
     out_path_p.parent.mkdir(parents=True, exist_ok=True)
-    meta = {"tokens_per_frame": tokens_per_frame, "h_code": h_code, "w_code": w_code, "bos_id": bos_id, "sep_id": sep_id, "num_embeddings": num_embeddings, "image_size": image_size}
+    meta = {
+        "tokens_per_frame": tokens_per_frame,
+        "h_code": h_code,
+        "w_code": w_code,
+        "bos_id": bos_id,
+        "sep_id": sep_id,
+        "num_embeddings": num_embeddings,
+        "image_size": image_size,
+        "use_pos2d": True,
+    }
     torch.save({"state_dict": gpt.state_dict(), "config": gpt.cfg.__dict__, "meta": meta}, out_path_p)
     return str(out_path_p), meta
 
@@ -1092,6 +1187,9 @@ def predict_autoregressive(image_path: str, vqvae_ckpt: str, gpt_ckpt: str, step
     sep_id = int(meta["sep_id"])  # type: ignore[index]
     num_embeddings = int(meta["num_embeddings"])  # type: ignore[index]
     image_size = int(meta["image_size"])  # type: ignore[index]
+    # Optional 2D pos info (backward compatibility)
+    max_h = int(meta.get("h_code", h_code))
+    max_w = int(meta.get("w_code", w_code))
 
     img = Image.open(image_path).convert("RGB")
     tfm = T.Compose([T.Resize(image_size, interpolation=T.InterpolationMode.BICUBIC, antialias=True), T.CenterCrop(image_size), T.ToTensor(), T.Normalize([0.5, 0.5, 0.5], [0.5, 0.5, 0.5])])
@@ -1108,7 +1206,25 @@ def predict_autoregressive(image_path: str, vqvae_ckpt: str, gpt_ckpt: str, step
         seg_prev = torch.zeros((b, 1 + current_prev.shape[1]), dtype=torch.long, device=device_t)
         seg_sep = torch.ones((b, 1), dtype=torch.long, device=device_t)
         prefix_segs = torch.cat([seg_prev, seg_sep], dim=1)
-        generated = gpt.generate(prefix_ids, prefix_segs, max_new_tokens=tokens_per_frame, temperature=temperature, top_k=top_k, forbidden_token_ids=(bos_id, sep_id))
+        # Build 2D pos if model expects it
+        use_pos2d = getattr(gpt.cfg, "use_pos2d", False)
+        if use_pos2d:
+            total_len = int(prefix_ids.shape[1] + tokens_per_frame)
+            rows_full = torch.zeros((b, total_len), dtype=torch.long, device=device_t)
+            cols_full = torch.zeros((b, total_len), dtype=torch.long, device=device_t)
+            rc = torch.arange(current_prev.shape[1], device=device_t)
+            r = (rc // max_w) + 1
+            c = (rc % max_w) + 1
+            rows_full[:, 1:1+current_prev.shape[1]] = r.view(1, -1).expand(b, -1)
+            cols_full[:, 1:1+current_prev.shape[1]] = c.view(1, -1).expand(b, -1)
+            rc2 = torch.arange(tokens_per_frame, device=device_t)
+            r2 = (rc2 // max_w) + 1
+            c2 = (rc2 % max_w) + 1
+            rows_full[:, prefix_ids.shape[1]:] = r2.view(1, -1).expand(b, -1)
+            cols_full[:, prefix_ids.shape[1]:] = c2.view(1, -1).expand(b, -1)
+            generated = gpt.generate(prefix_ids, prefix_segs, max_new_tokens=tokens_per_frame, temperature=temperature, top_k=top_k, top_p=None, forbidden_token_ids=(bos_id, sep_id), row_ids_full=rows_full, col_ids_full=cols_full)
+        else:
+            generated = gpt.generate(prefix_ids, prefix_segs, max_new_tokens=tokens_per_frame, temperature=temperature, top_k=top_k, forbidden_token_ids=(bos_id, sep_id))
         next_tokens = generated[:, -tokens_per_frame:]
         tokens_reshaped = next_tokens.view(1, h_code, w_code)
         x_rec = vqvae.decode_from_indices(tokens_reshaped)
@@ -1154,6 +1270,7 @@ def evaluate_next_frame(
     bos_id = int(meta["bos_id"])  # type: ignore[index]
     sep_id = int(meta["sep_id"])  # type: ignore[index]
     image_size = int(meta["image_size"])  # type: ignore[index]
+    use_pos2d = getattr(gpt.cfg, "use_pos2d", False)
 
     ds = FramePairDataset(root=data_root, image_size=image_size, is_train=False)
     dl = DataLoader(ds, batch_size=batch_size, shuffle=True, num_workers=2, pin_memory=True)
@@ -1174,7 +1291,23 @@ def evaluate_next_frame(
             seg_prev = torch.zeros((x_t.shape[0], 1 + prev_tokens.shape[1]), dtype=torch.long, device=device_t)
             seg_sep = torch.ones((x_t.shape[0], 1), dtype=torch.long, device=device_t)
             prefix_segs = torch.cat([seg_prev, seg_sep], dim=1)
-            generated = gpt.generate(prefix_ids, prefix_segs, max_new_tokens=tokens_per_frame, temperature=temperature, top_k=top_k, forbidden_token_ids=(bos_id, sep_id))
+            if use_pos2d:
+                total_len = int(prefix_ids.shape[1] + tokens_per_frame)
+                rows_full = torch.zeros((x_t.shape[0], total_len), dtype=torch.long, device=device_t)
+                cols_full = torch.zeros((x_t.shape[0], total_len), dtype=torch.long, device=device_t)
+                rc = torch.arange(prev_tokens.shape[1], device=device_t)
+                r = (rc // w_code) + 1
+                c = (rc % w_code) + 1
+                rows_full[:, 1:1+prev_tokens.shape[1]] = r.view(1, -1).expand(x_t.shape[0], -1)
+                cols_full[:, 1:1+prev_tokens.shape[1]] = c.view(1, -1).expand(x_t.shape[0], -1)
+                rc2 = torch.arange(tokens_per_frame, device=device_t)
+                r2 = (rc2 // w_code) + 1
+                c2 = (rc2 % w_code) + 1
+                rows_full[:, prefix_ids.shape[1]:] = r2.view(1, -1).expand(x_t.shape[0], -1)
+                cols_full[:, prefix_ids.shape[1]:] = c2.view(1, -1).expand(x_t.shape[0], -1)
+                generated = gpt.generate(prefix_ids, prefix_segs, max_new_tokens=tokens_per_frame, temperature=temperature, top_k=top_k, top_p=None, forbidden_token_ids=(bos_id, sep_id), row_ids_full=rows_full, col_ids_full=cols_full)
+            else:
+                generated = gpt.generate(prefix_ids, prefix_segs, max_new_tokens=tokens_per_frame, temperature=temperature, top_k=top_k, forbidden_token_ids=(bos_id, sep_id))
             next_tokens = generated[:, -tokens_per_frame:]
             tokens_reshaped = next_tokens.view(x_t.shape[0], h_code, w_code)
             x_pred = vqvae.decode_from_indices(tokens_reshaped)
@@ -1202,72 +1335,68 @@ def train_predictor_ae(
     bottleneck_channels: int = 512,
     device: str = "cuda",
 ) -> str:
+    # Note: ae_ckpt is ignored by design in this refactor (no AE usage)
     device_t = torch.device(device if torch.cuda.is_available() or device == "cpu" else "cpu")
-    ds = FramePairDataset(root=data_root, image_size=image_size, is_train=True)
-    dl = DataLoader(ds, batch_size=batch_size, shuffle=True, num_workers=4, pin_memory=True)
 
-    # Initialize from AE weights and keep AE as a frozen teacher for consistency loss
-    ckpt = torch.load(ae_ckpt, map_location="cpu")
-    ae_cfg = AEConfig(**ckpt["config"])  # type: ignore[arg-type]
-    arch = ckpt.get("arch", "unet")
+    # Load exactly two frames: frame_0001.png (input) and frame_0002.png (target)
+    data_root_p = Path(data_root)
+    path_1 = data_root_p / "frame_0001.png"
+    path_2 = data_root_p / "frame_0002.png"
+    if not path_1.exists() or not path_2.exists():
+        raise FileNotFoundError(f"Expected two frames at {path_1} and {path_2}")
+
+    tfm = T.Compose([
+        T.Resize(image_size, interpolation=T.InterpolationMode.BICUBIC, antialias=True),
+        T.CenterCrop(image_size),
+        T.ToTensor(),
+        T.Normalize([0.5, 0.5, 0.5], [0.5, 0.5, 0.5]),
+    ])
+    x_t = tfm(Image.open(path_1).convert("RGB")).unsqueeze(0).to(device_t)
+    x_tp1 = tfm(Image.open(path_2).convert("RGB")).unsqueeze(0).to(device_t)
+
     translator = UNetTranslator(image_size=image_size, base_channels=base_channels, bottleneck_channels=bottleneck_channels).to(device_t)
-    if arch == "unet":
-        ae_model = UNetAutoencoder(ae_cfg)
-    else:
-        ae_model = ConvAutoencoder(ae_cfg)
-    ae_model.load_state_dict(ckpt["state_dict"])  # type: ignore[index]
-    ae_model = ae_model.to(device_t).eval()
-    for p in ae_model.parameters():
-        p.requires_grad = False
-    if arch == "unet":
-        translator.init_from_unet_autoencoder(ae_model.state_dict())
-
     opt = torch.optim.AdamW(translator.parameters(), lr=lr, betas=(0.9, 0.95), weight_decay=0.01)
     l1 = nn.L1Loss()
 
     translator.train()
-    last_batch = None
     for epoch in range(1, epochs + 1):
-        pbar = tqdm(dl, desc=f"PredictorAE {epoch}/{epochs}")
-        for x_t, x_tp1 in pbar:
-            x_t = x_t.to(device_t, non_blocking=True)
-            x_tp1 = x_tp1.to(device_t, non_blocking=True)
-            last_batch = (x_t, x_tp1)
-            # Residual prediction: y = x_t + r
-            r = translator(torch.cat([x_t, x_t], dim=1))
-            y = torch.clamp(x_t + r, -1.0, 1.0)
+        # Single pair training: predict residual then compose output
+        r = translator(torch.cat([x_t, x_t], dim=1))
+        y = torch.clamp(x_t + r, -1.0, 1.0)
 
-            # Dynamic mask from GT difference
-            with torch.no_grad():
-                diff = (x_tp1 - x_t).abs().mean(dim=1, keepdim=True)
-                dyn_mask = (diff > 0.02).float()
-            static_mask = 1.0 - dyn_mask
+        # Losses encouraging exact reconstruction
+        loss_rec = l1(y, x_tp1)
+        loss_edge = sobel_edge_loss(y, x_tp1)
+        loss_ssim = ssim_loss_simple(y, x_tp1)
+        loss = loss_rec + 0.1 * loss_edge + 0.5 * loss_ssim
 
-            # Losses
-            loss_rec = l1(y, x_tp1)
-            loss_edge = sobel_edge_loss(y, x_tp1)
-            loss_ssim = ssim_loss_simple(y, x_tp1)
-            loss_dyn = F.l1_loss(y * dyn_mask, x_tp1 * dyn_mask)
-            loss_static_id = F.l1_loss(y * static_mask, x_t * static_mask)
-            # AE consistency (teacher): outputs should reconstruct like target
-            with torch.no_grad():
-                rec_y = ae_model(y)
-                rec_t1 = ae_model(x_tp1)
-            loss_ae = l1(rec_y, rec_t1)
-            loss = loss_rec + 0.1 * loss_edge + 0.5 * loss_ssim + 0.5 * loss_dyn + 0.1 * loss_static_id + 0.1 * loss_ae
-            opt.zero_grad(set_to_none=True)
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(translator.parameters(), 1.0)
-            opt.step()
-            pbar.set_postfix({"l1": float(loss_rec)})
+        # Compute exact-match reward signal (non-differentiable; for logging/early stop)
+        with torch.no_grad():
+            y01 = _to01(y)
+            t101 = _to01(x_tp1)
+            y_u8 = (y01 * 255.0).round().to(torch.uint8)
+            t1_u8 = (t101 * 255.0).round().to(torch.uint8)
+            exact = bool(torch.equal(y_u8, t1_u8))
+            pixel_acc = float((y_u8 == t1_u8).float().mean().item())
 
-        if last_batch is not None:
-            translator.eval()
-            with torch.no_grad():
-                r_vis = translator(torch.cat([last_batch[0][:1], last_batch[0][:1]], dim=1))
-                y_vis = torch.clamp(last_batch[0][:1] + r_vis, -1.0, 1.0)
-            save_image_grid(last_batch[0][:1], y_vis, Path("samples/predictor_ae"), f"epoch_{epoch:03d}.png")
-            translator.train()
+        opt.zero_grad(set_to_none=True)
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(translator.parameters(), 1.0)
+        opt.step()
+
+        tqdm.write(f"Epoch {epoch}/{epochs} | L1: {float(loss_rec):.4f} | Acc_exact: {pixel_acc:.4f} | Exact: {int(exact)}")
+
+        # Save visualization each epoch
+        translator.eval()
+        with torch.no_grad():
+            r_vis = translator(torch.cat([x_t, x_t], dim=1))
+            y_vis = torch.clamp(x_t + r_vis, -1.0, 1.0)
+        save_image_grid(x_t, y_vis, Path("samples/predictor_ae"), f"epoch_{epoch:03d}.png")
+        translator.train()
+
+        # Early stop when exact pixel match is achieved
+        if exact:
+            break
 
     out_path_p = Path(out_path)
     out_path_p.parent.mkdir(parents=True, exist_ok=True)

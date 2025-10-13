@@ -291,7 +291,7 @@ def visualize_prediction(input_frames, target_frame, predicted_frame):
 # ==================== 7. FONCTION PRINCIPALE ====================
 def main():
     # Configuration
-    IMG_SIZE = 64
+    IMG_SIZE = 256
     CONTEXT_LENGTH = 2  # Nombre d'images en entrée
     BATCH_SIZE = 16
     NUM_EPOCHS = 30
@@ -305,7 +305,7 @@ def main():
     
     # 2. Créer le dataset
     print("\n📦 Création du dataset...")
-    dataset = VideoSequenceDataset("data/frames", context_length=CONTEXT_LENGTH, img_size=IMG_SIZE)
+    dataset = VideoSequenceDataset("/kaggle/input/anima-s-dataset/test/", context_length=CONTEXT_LENGTH, img_size=IMG_SIZE)
     train_loader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=0)
     print(f"   Nombre d'échantillons: {len(dataset)}")
     
